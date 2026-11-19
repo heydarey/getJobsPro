@@ -49,6 +49,8 @@ public class BossConfigEntity {
     private Integer allowRepeatChat;
     /** 重复沟通消息，每行一条。 */
     private String repeatChatMessages;
+    /** 每日最多打招呼次数（真实发送），0 表示不限 */
+    private Integer dailyGreetLimit;
     /** 是否过滤不在线HR（1=启用，0=关闭） */
     private Integer filterDeadHr;
     /** HR不在线状态列表（逗号或括号列表） */

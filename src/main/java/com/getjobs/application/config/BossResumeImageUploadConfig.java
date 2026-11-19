@@ -10,12 +10,17 @@ import org.springframework.util.unit.DataSize;
 @Configuration
 public class BossResumeImageUploadConfig {
 
+    /**
+     * 配置 multipart 上传限制：单文件 10MB，单次请求最多 5 张图片。
+     *
+     * @return MultipartConfigElement，Spring 使用的上传限制配置
+     */
     @Bean
     public MultipartConfigElement multipartConfigElement() {
         MultipartConfigFactory factory = new MultipartConfigFactory();
         factory.setMaxFileSize(DataSize.ofMegabytes(10));
-        // multipart 本身有少量边界和请求头开销，请求上限需要略大于文件上限。
-        factory.setMaxRequestSize(DataSize.ofMegabytes(11));
+        // 多图上传最多 5 张，每张 10MB；multipart 有少量边界和请求头开销，请求上限需要略大于文件总上限。
+        factory.setMaxRequestSize(DataSize.ofMegabytes(51));
         return factory.createMultipartConfig();
     }
 }

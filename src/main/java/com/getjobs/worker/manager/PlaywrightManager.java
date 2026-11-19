@@ -368,6 +368,9 @@ public class PlaywrightManager {
             zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
             log.info("✓ 智联招聘 Page已创建");
 
+            watchPageClose(bossPage, "Boss直聘");
+            watchPageClose(zhilianPage, "智联招聘");
+
             // 四个业务页都建好了，把持久化上下文自带的启动空白页关掉
             for (Page startup : startupPages) {
                 try {
@@ -1841,6 +1844,83 @@ public class PlaywrightManager {
         } catch (Exception e) {
             log.error("关闭Playwright管理器时发生错误", e);
         }
+    }
+
+    /**
+     * 标签页被关闭时记录日志，便于定位是谁关闭了平台标签页。
+     *
+     * @param page Page，必填，要监听的标签页
+     * @param name String，必填，平台名称（仅用于日志）
+     */
+    private void watchPageClose(Page page, String name) {
+        try {
+            page.onClose(p -> log.warn("{}标签页已被关闭（最后地址：{}），下次启动任务时会自动重新打开", name, safePageUrl(p)));
+        } catch (Exception e) {
+            log.debug("注册{}标签页关闭监听失败：{}", name, e.getMessage());
+        }
+    }
+
+    /**
+     * 安全读取标签页地址。
+     *
+     * @param page Page，可空
+     * @return String，地址；读取失败时为空串
+     */
+    private static String safePageUrl(Page page) {
+        try {
+            return page == null ? "" : page.url();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * 确保指定平台的标签页可用：标签页已被关闭（在 noVNC 中误关、站点脚本关闭窗口等）时，
+     * 在当前浏览器上下文中重新打开该平台首页，并重新挂上登录监控、刷新登录状态。
+     * 不重新注入数据库中的 Cookie，避免用旧 Cookie 覆盖浏览器里当前有效的登录态。
+     * 调用前应先调用 {@link #ensureReady()} 确保浏览器本身可用。
+     *
+     * @param platform String，必填，平台标识：boss / zhilian；其他值不做处理
+     * @return boolean，true 表示标签页原本已关闭、本次重新打开了
+     */
+    public boolean ensurePlatformPage(String platform) {
+        return Boolean.TRUE.equals(callOnPlaywright(() -> {
+            if ("zhilian".equals(platform)) {
+                if (zhilianPage != null && !zhilianPage.isClosed()) return false;
+                log.warn("智联招聘标签页已关闭，重新打开");
+                zhilianPage = context.newPage();
+                zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
+                watchPageClose(zhilianPage, "智联招聘");
+                try {
+                    zhilianPage.navigate(ZHILIAN_URL, new Page.NavigateOptions().setTimeout(60000)
+                            .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                    zhilianPage.waitForLoadState(LoadState.NETWORKIDLE, new Page.WaitForLoadStateOptions().setTimeout(LOAD_STATE_TIMEOUT));
+                } catch (Exception e) {
+                    log.debug("重新打开智联首页时等待加载失败：{}", e.getMessage());
+                }
+                setLoginStatus("zhilian", checkIfZhilianLoggedIn());
+                setupZhilianLoginMonitoring(zhilianPage);
+                return true;
+            }
+            if ("boss".equals(platform)) {
+                if (bossPage != null && !bossPage.isClosed()) return false;
+                log.warn("Boss直聘标签页已关闭，重新打开");
+                bossPage = context.newPage();
+                bossPage.setDefaultTimeout(DEFAULT_TIMEOUT);
+                watchPageClose(bossPage, "Boss直聘");
+                try {
+                    bossPage.navigate(BOSS_ENTRY_URL, new Page.NavigateOptions().setTimeout(60000)
+                            .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                    bossPage.waitForLoadState(LoadState.NETWORKIDLE, new Page.WaitForLoadStateOptions().setTimeout(LOAD_STATE_TIMEOUT));
+                } catch (Exception e) {
+                    log.debug("重新打开Boss页面时等待加载失败：{}", e.getMessage());
+                }
+                setLoginStatus("boss", checkIfLoggedIn());
+                setupLoginMonitoring(bossPage);
+                return true;
+            }
+            return false;
+        }));
     }
 
     /**

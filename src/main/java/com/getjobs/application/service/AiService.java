@@ -104,7 +104,7 @@ public class AiService {
                                     .getJSONObject("message");
                             responseContent = messageObject.getString("content");
                         } catch (Exception ignore) {
-                            responseContent = response.body(); // 最后兜底：返回原始文本，避免空值
+                            throw new RuntimeException("AI返回内容无法解析，已拒绝使用原始返回体"); // 原始返回体可能被当作招呼语发给HR，必须报错
                         }
                     }
                 } else {
@@ -144,6 +144,74 @@ public class AiService {
             log.error("调用AI服务异常", e);
             throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
         }
+    }
+
+    /**
+     * 严格模式调用 Chat Completions：用于岗位匹配判定。
+     * 任何异常（配置缺失、密钥含空白、非 200、内容为空、结构无法解析）都抛出异常，由调用方按“不发送”处理。
+     *
+     * @param systemPrompt String，必填，系统提示词
+     * @param userContent  String，必填，用户消息
+     * @return String，模型返回的文本内容，非空
+     * @throws RuntimeException 调用失败或返回内容不可用时抛出
+     */
+    public String chatStrict(String systemPrompt, String userContent) {
+        var cfg = configService.getAiConfigs();
+        String baseUrl = cfg.get("BASE_URL");
+        String apiKey = cfg.get("API_KEY");
+        String model = cfg.get("MODEL");
+        if (baseUrl == null || baseUrl.isBlank() || model == null || model.isBlank()) {
+            throw new IllegalStateException("AI 未配置 BASE_URL 或 MODEL");
+        }
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("AI 未配置 API_KEY");
+        }
+        if (apiKey.trim().matches(".*\\s.*")) {
+            throw new IllegalStateException("API_KEY 中包含空格或换行，不是有效密钥，请在环境配置中重新填写");
+        }
+        String endpoint = buildChatCompletionsEndpoint(baseUrl);
+        JSONObject body = new JSONObject();
+        body.put("model", model);
+        body.put("temperature", 0.1);
+        JSONArray messages = new JSONArray();
+        messages.put(new JSONObject().put("role", "system").put("content", systemPrompt));
+        messages.put(new JSONObject().put("role", "user").put("content", userContent));
+        body.put("messages", messages);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(60))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + apiKey.trim())
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                .build();
+        HttpResponse<String> response;
+        try {
+            response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("AI 请求被中断", e);
+        } catch (Exception e) {
+            throw new RuntimeException("AI 请求失败：" + e.getMessage(), e);
+        }
+        if (response.statusCode() != 200) {
+            String detail = response.body() == null ? "" : response.body();
+            throw new RuntimeException("AI 请求失败，状态码 " + response.statusCode() + "："
+                    + detail.substring(0, Math.min(200, detail.length())));
+        }
+        String content;
+        try {
+            content = new JSONObject(response.body()).getJSONArray("choices")
+                    .getJSONObject(0).getJSONObject("message").getString("content");
+        } catch (Exception e) {
+            throw new RuntimeException("AI 返回结构无法解析", e);
+        }
+        if (content == null || content.isBlank()) {
+            throw new RuntimeException("AI 返回内容为空");
+        }
+        return content.trim();
     }
 
     private String normalizeBaseUrl(String baseUrl) {
@@ -235,8 +303,8 @@ public class AiService {
                     return messageObject.getString("content");
                 } catch (Exception ignore) {
                 }
-                // 无法解析则直接返回原始体，避免空值中断流程
-                return response.body();
+                // 原始返回体可能被当作招呼语发给HR，无法解析时必须报错
+                throw new RuntimeException("AI返回内容无法解析，已拒绝使用原始返回体");
             }
             log.error("Responses API 调用失败: status={}, endpoint={}, body={}", response.statusCode(), endpoint, response.body());
             throw new RuntimeException("AI请求失败，状态码: " + response.statusCode() + ", 详情: " + response.body());

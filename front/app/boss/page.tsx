@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import Image from 'next/image'
 import { createSSEWithBackoff } from '@/lib/sse'
 import { createPortal } from 'react-dom'
-import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut, BiImage, BiUpload, BiZoomIn, BiX } from 'react-icons/bi'
+import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut, BiImage, BiUpload, BiZoomIn, BiX, BiTestTube, BiListCheck } from 'react-icons/bi'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -14,6 +14,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PageHeader from '@/app/components/PageHeader'
 import AnalysisContent from '@/app/boss/analysis/AnalysisContent'
 import { API_BASE } from '@/lib/api'
+import MatchRuleCard, { MatchRuleCardHandle } from '@/app/components/MatchRuleCard'
+import EvaluationList, { EvaluationItem } from '@/app/components/EvaluationList'
 
 interface BossConfig {
   id?: number
@@ -33,6 +35,7 @@ interface BossConfig {
   sendImgResume?: number
   allowRepeatChat?: number
   repeatChatMessages?: string
+  dailyGreetLimit?: number
   filterDeadHr?: number
   deadStatus?: string
 }
@@ -64,14 +67,28 @@ interface BlacklistItem {
   type: string
 }
 
-interface ResumeImageInfo {
-  exists: boolean
+interface ResumeImageItem {
+  index: number
   fileName?: string
   contentType?: string
   size?: number
   updatedAt?: number
   previewUrl?: string
 }
+
+interface ResumeImageInfo {
+  exists: boolean
+  count?: number
+  images?: ResumeImageItem[]
+  fileName?: string
+  contentType?: string
+  size?: number
+  updatedAt?: number
+  previewUrl?: string
+}
+
+/** 单次最多上传的图片简历张数，与后端 BossResumeImageService.MAX_IMAGE_COUNT 保持一致 */
+const MAX_RESUME_IMAGE_COUNT = 5
 
 export default function BossPage() {
   const [config, setConfig] = useState<BossConfig>({
@@ -113,6 +130,15 @@ export default function BossPage() {
   const [loading, setLoading] = useState(true)
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  // 以下状态全部来自后端 /api/boss/status 轮询，页面刷新或切换后也能还原真实运行状态
+  const [stopping, setStopping] = useState(false)
+  const [runMode, setRunMode] = useState('')
+  const [runMessage, setRunMessage] = useState('')
+  const [evaluations, setEvaluations] = useState<EvaluationItem[]>([])
+  const [todayGreetings, setTodayGreetings] = useState<number | null>(null)
+  const [lastResult, setLastResult] = useState<{ mode?: string; success?: boolean; message?: string; finishedAt?: string } | null>(null)
+  const [showTestDialog, setShowTestDialog] = useState(false)
+  const [testStarting, setTestStarting] = useState(false)
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -123,15 +149,17 @@ export default function BossPage() {
   const [resumeImage, setResumeImage] = useState<ResumeImageInfo>({ exists: false })
   const [resumeImageUploading, setResumeImageUploading] = useState(false)
   const [resumeImageMessage, setResumeImageMessage] = useState<{ success: boolean; text: string } | null>(null)
-  const [localResumePreviewUrl, setLocalResumePreviewUrl] = useState<string | null>(null)
+  const [localResumePreviewUrls, setLocalResumePreviewUrls] = useState<string[]>([])
   const [showResumePreview, setShowResumePreview] = useState(false)
   const resumeImageInputRef = useRef<HTMLInputElement>(null)
+  // 岗位匹配规则卡片，保存配置 / 开始投递 / 单次测试时一并保存规则修改
+  const matchRuleRef = useRef<MatchRuleCardHandle>(null)
 
   useEffect(() => {
     return () => {
-      if (localResumePreviewUrl) URL.revokeObjectURL(localResumePreviewUrl)
+      localResumePreviewUrls.forEach(url => URL.revokeObjectURL(url))
     }
-  }, [localResumePreviewUrl])
+  }, [localResumePreviewUrls])
 
   useEffect(() => {
     if (!showResumePreview) return
@@ -201,6 +229,33 @@ export default function BossPage() {
       client.close()
     }
   }, [])
+
+  /**
+   * 从后端读取任务真实状态，同步按钮与判定记录。
+   * 入参：无。出参：Promise<void>。
+   */
+  const syncRunStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/boss/status`)
+      if (!res.ok) return
+      const data = await res.json()
+      setIsDelivering(!!data.isRunning)
+      setStopping(!!data.stopping)
+      setRunMode(data.runMode || '')
+      setRunMessage(data.lastMessage || '')
+      setEvaluations(Array.isArray(data.evaluations) ? data.evaluations : [])
+      setTodayGreetings(typeof data.todayGreetings === 'number' ? data.todayGreetings : null)
+      setLastResult(data.lastResult && Object.keys(data.lastResult).length > 0 ? data.lastResult : null)
+    } catch {
+      // 网络抖动时保持当前显示，下一轮再同步
+    }
+  }, [])
+
+  useEffect(() => {
+    syncRunStatus()
+    const timer = setInterval(syncRunStatus, 3000)
+    return () => clearInterval(timer)
+  }, [syncRunStatus])
 
   const fetchAllData = async () => {
     try {
@@ -418,7 +473,21 @@ export default function BossPage() {
     return `[${list.join(',')}]`
   }
 
-  const handleSave = async (silent: boolean = false, overrides?: Partial<BossConfig>) => {
+  /**
+   * 保存 Boss 配置；岗位匹配规则有未保存修改时先一并保存。
+   * 入参：silent boolean，可选，默认 false，true 时不弹结果框；overrides Partial<BossConfig>，可选，覆盖当前表单字段。
+   * 出参：Promise<boolean>，规则与配置都保存成功为 true。
+   */
+  const handleSave = async (silent: boolean = false, overrides?: Partial<BossConfig>): Promise<boolean> => {
+    const ruleResult = await matchRuleRef.current?.save({ onlyIfDirty: true })
+    if (ruleResult && !ruleResult.ok) {
+      if (!silent) {
+        setSaveResult({ success: false, message: `保存失败：${ruleResult.message}` })
+        setShowSaveDialog(true)
+      }
+      return false
+    }
+    const ruleSaved = !!ruleResult && !ruleResult.skipped
     try {
       // 组装要保存的负载：多选使用括号列表
       const payload: BossConfig = {
@@ -452,9 +521,10 @@ export default function BossPage() {
 
         fetchAllData()
         if (!silent) {
-          setSaveResult({ success: true, message: '保存成功，配置与Cookie已更新。' })
+          setSaveResult({ success: true, message: ruleSaved ? '保存成功，配置、Cookie与岗位匹配规则已更新。' : '保存成功，配置与Cookie已更新。' })
           setShowSaveDialog(true)
         }
+        return true
       } else {
         // 保存失败：不弹框，记录日志
         console.warn('保存失败：后端返回非 2xx 状态')
@@ -462,6 +532,7 @@ export default function BossPage() {
           setSaveResult({ success: false, message: '保存失败：后端返回异常状态。' })
           setShowSaveDialog(true)
         }
+        return false
       }
     } catch (error) {
       console.error('Failed to save config:', error)
@@ -470,32 +541,47 @@ export default function BossPage() {
         setSaveResult({ success: false, message: '保存失败：网络或服务异常。' })
         setShowSaveDialog(true)
       }
+      return false
     }
   }
 
+  /**
+   * 选择图片简历后校验并上传，按选择顺序整体替换后端已保存的图片。
+   * 入参：event（React.ChangeEvent<HTMLInputElement>，必填，无默认值）文件选择事件，可多选 1~5 张
+   * 出参：Promise<void>，无返回值；结果通过 resumeImage / resumeImageMessage 状态展示
+   */
   const handleResumeImageChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
+    // 浏览器多选时按文件名排序，命名为 1.png、2.png… 即可控制发送顺序
+    const files = Array.from(event.target.files ?? []).sort((a, b) =>
+      a.name.localeCompare(b.name, 'zh-CN', { numeric: true })
+    )
     event.target.value = ''
-    if (!file) return
+    if (files.length === 0) return
 
+    if (files.length > MAX_RESUME_IMAGE_COUNT) {
+      setResumeImageMessage({ success: false, text: `图片简历最多 ${MAX_RESUME_IMAGE_COUNT} 张。` })
+      return
+    }
     const allowedTypes = new Set(['image/png', 'image/jpeg', 'image/gif'])
-    const allowedExtension = /\.(png|jpe?g|gif)$/i.test(file.name)
-    if ((!allowedTypes.has(file.type) && !allowedExtension) || file.size === 0) {
-      setResumeImageMessage({ success: false, text: '请选择有效的 PNG、JPG、JPEG 或 GIF 图片。' })
-      return
-    }
-    if (file.size > 10 * 1024 * 1024) {
-      setResumeImageMessage({ success: false, text: '图片大小不能超过 10MB。' })
-      return
+    for (const file of files) {
+      const allowedExtension = /\.(png|jpe?g|gif)$/i.test(file.name)
+      if ((!allowedTypes.has(file.type) && !allowedExtension) || file.size === 0) {
+        setResumeImageMessage({ success: false, text: `${file.name} 不是有效的 PNG、JPG、JPEG 或 GIF 图片。` })
+        return
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        setResumeImageMessage({ success: false, text: `${file.name} 超过 10MB。` })
+        return
+      }
     }
 
-    setLocalResumePreviewUrl(URL.createObjectURL(file))
+    setLocalResumePreviewUrls(files.map(file => URL.createObjectURL(file)))
     setResumeImageUploading(true)
     setResumeImageMessage(null)
     try {
       const formData = new FormData()
-      formData.append('file', file)
-      const response = await fetch(`${API_BASE}/api/boss/config/resume-image`, {
+      files.forEach(file => formData.append('files', file))
+      const response = await fetch(`${API_BASE}/api/boss/config/resumeImages`, {
         method: 'POST',
         body: formData,
       })
@@ -505,10 +591,10 @@ export default function BossPage() {
       }
 
       setResumeImage(data.resumeImage || { exists: true })
-      setLocalResumePreviewUrl(null)
-      setResumeImageMessage({ success: true, text: '图片简历上传成功，可以预览或重新上传。' })
+      setLocalResumePreviewUrls([])
+      setResumeImageMessage({ success: true, text: `图片简历上传成功，共 ${files.length} 张，可以预览或重新上传。` })
     } catch (error) {
-      setLocalResumePreviewUrl(null)
+      setLocalResumePreviewUrls([])
       setResumeImageMessage({
         success: false,
         text: error instanceof Error ? error.message : '图片简历上传失败，请确认后端服务已启动。',
@@ -525,11 +611,22 @@ export default function BossPage() {
       : `${Math.max(1, Math.round(size / 1024))} KB`
   }
 
-  const resumePreviewUrl = localResumePreviewUrl || (
-    resumeImage.exists && resumeImage.previewUrl
-      ? `${API_BASE}${resumeImage.previewUrl}?v=${resumeImage.updatedAt || 0}`
-      : null
-  )
+  /** 已保存图片列表；兼容只返回单图字段的旧版后端 */
+  const savedResumeImages: ResumeImageItem[] = resumeImage.exists
+    ? (resumeImage.images && resumeImage.images.length > 0
+        ? resumeImage.images
+        : [{ index: 1, fileName: resumeImage.fileName, size: resumeImage.size, updatedAt: resumeImage.updatedAt, previewUrl: resumeImage.previewUrl }])
+    : []
+
+  /** 预览地址列表：上传中优先展示本地选择的图片，否则展示后端已保存的图片 */
+  const resumePreviewUrls: string[] = localResumePreviewUrls.length > 0
+    ? localResumePreviewUrls
+    : savedResumeImages
+        .filter(item => item.previewUrl)
+        .map(item => {
+          const url = `${API_BASE}${item.previewUrl}`
+          return `${url}${url.includes('?') ? '&' : '?'}v=${item.updatedAt || 0}`
+        })
 
   const handleAddBlacklist = async () => {
     if (!newBlacklistKeyword.trim()) {
@@ -580,7 +677,17 @@ export default function BossPage() {
     }
   }
 
+  /**
+   * 启动正式投递；岗位匹配规则有未保存修改时先保存，保存失败不启动。
+   * 入参：无。出参：Promise<void>。
+   */
   const handleStartDelivery = async () => {
+    const ruleResult = await matchRuleRef.current?.save({ onlyIfDirty: true })
+    if (ruleResult && !ruleResult.ok) {
+      setSaveResult({ success: false, title: '启动失败', message: ruleResult.message })
+      setShowSaveDialog(true)
+      return
+    }
     try {
       setIsDelivering(true)
       const response = await fetch(`${API_BASE}/api/boss/start`, {
@@ -597,8 +704,9 @@ export default function BossPage() {
         console.warn('启动失败：', data.message)
         setSaveResult({ success: false, title: '启动失败', message: data.message || '启动投递失败，请查看后端日志' })
         setShowSaveDialog(true)
-        setIsDelivering(false)
+        setIsDelivering(data.status === 'running')
       }
+      syncRunStatus()
     } catch (error) {
       console.error('Failed to start delivery:', error)
       setSaveResult({
@@ -611,25 +719,53 @@ export default function BossPage() {
     }
   }
 
+  /**
+   * 发出停止指令。按钮状态以后端轮询结果为准，任务真正退出后才变回“开始投递”。
+   * 入参：无。出参：Promise<void>。
+   */
   const handleStopDelivery = async () => {
     try {
+      setStopping(true)
       const response = await fetch(`${API_BASE}/api/boss/stop`, {
         method: 'POST',
       })
       const data = await response.json()
-
-      if (data.success) {
-        // 停止成功：不弹框
-        setIsDelivering(false)
-      } else {
-        // 停止失败：也要将状态设置为未投递（因为可能任务已经结束）
+      if (!data.success) {
         console.warn('停止失败：', data.message)
-        setIsDelivering(false)
       }
     } catch (error) {
       console.error('Failed to stop delivery:', error)
-      // 停止失败：也要将状态设置为未投递
-      setIsDelivering(false)
+    } finally {
+      syncRunStatus()
+    }
+  }
+
+  /**
+   * 启动单次测试：先保存当前配置，再按所选模式执行一次。
+   * 入参：dryRun boolean，必填，true 只评估不发送，false 对找到的第一个匹配岗位真实发送。
+   * 出参：Promise<void>。
+   */
+  const handleTestDelivery = async (dryRun: boolean) => {
+    setTestStarting(true)
+    try {
+      if (!(await handleSave(true))) {
+        setSaveResult({ success: false, title: '测试未启动', message: '保存配置或岗位匹配规则失败，请检查后重试' })
+        setShowSaveDialog(true)
+        return
+      }
+      const response = await fetch(`${API_BASE}/api/boss/testDelivery?dryRun=${dryRun}`, { method: 'POST' })
+      const data = await response.json()
+      if (!data.success) {
+        setSaveResult({ success: false, title: '测试未启动', message: data.message || '启动失败，请查看后端日志' })
+        setShowSaveDialog(true)
+      }
+      setShowTestDialog(false)
+      syncRunStatus()
+    } catch {
+      setSaveResult({ success: false, title: '测试未启动', message: `无法连接后端服务（${API_BASE}）` })
+      setShowSaveDialog(true)
+    } finally {
+      setTestStarting(false)
     }
   }
 
@@ -677,6 +813,10 @@ export default function BossPage() {
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 请先登录Boss
               </Button>
+            ) : isDelivering && stopping ? (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
+                <BiStop className="mr-1" /> 停止中…
+              </Button>
             ) : isDelivering ? (
               <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
                 <BiStop className="mr-1" /> 停止投递
@@ -684,6 +824,11 @@ export default function BossPage() {
             ) : (
               <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
                 <BiPlay className="mr-1" /> 开始投递
+              </Button>
+            )}
+            {!checkingLogin && isLoggedIn && !isDelivering && (
+              <Button onClick={() => setShowTestDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white px-4 shadow-lg">
+                <BiTestTube className="mr-1" /> 单次测试
               </Button>
             )}
             <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
@@ -716,10 +861,35 @@ export default function BossPage() {
               <div className="space-y-4">
                 <p className="text-sm text-muted-foreground">请在浏览器标签页中登录 Boss 直聘平台，登录成功后系统会自动检测登录状态。</p>
                 <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务。</p>
-                <p className="text-sm text-muted-foreground">点击“保存配置”按钮可手动保存当前登录相关信息到数据库。</p>
+                <p className="text-sm text-muted-foreground">点击“保存配置”保存本页配置、岗位匹配规则与登录 Cookie；开始投递前也会自动保存未保存的匹配规则。</p>
               </div>
             </CardContent>
           </Card>
+
+          {/* 任务状态与判定记录：数据来自后端轮询 */}
+          {(isDelivering || evaluations.length > 0 || lastResult) && (
+            <Card className="animate-in fade-in slide-in-from-bottom-5 duration-700">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <BiListCheck className="text-primary" />
+                  {runMode === 'normal' ? '投递任务' : runMode ? '单次测试' : '任务'}状态
+                </CardTitle>
+                <CardDescription>
+                  {isDelivering
+                    ? `运行中（${runMode === 'test' ? '单次测试：真实发送 1 个' : runMode === 'testDry' ? '单次测试：只评估不发送' : '正式投递'}）：${runMessage}`
+                    : lastResult
+                      ? `最近一次${lastResult.mode === 'normal' ? '投递' : '测试'}于 ${lastResult.finishedAt || ''} 结束：${lastResult.message || ''}`
+                      : '当前没有运行中的任务'}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <EvaluationList items={evaluations} />
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 岗位匹配规则（与智联共用） */}
+          <MatchRuleCard ref={matchRuleRef} sayHi={config.sayHi ?? ''} />
 
           {/* 投递行为 */}
           <Card className="animate-in fade-in slide-in-from-bottom-5 duration-700">
@@ -732,11 +902,41 @@ export default function BossPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
+                <div className="space-y-2 rounded-lg border bg-muted/20 p-4">
+                  <Label htmlFor="sayHi" className="text-base font-medium">固定招呼语</Label>
+                  <textarea
+                    id="sayHi"
+                    rows={4}
+                    value={config.sayHi ?? ''}
+                    onChange={event => setConfig(prev => ({ ...prev, sayHi: event.target.value }))}
+                    placeholder="发给 HR 的第一条消息"
+                    className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm leading-7 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  />
+                  <p className="text-sm text-muted-foreground">
+                    “AI 配置”中开启 AI 招呼语时，AI 以这段话为基础、按岗位调整重点（只能使用技能介绍和这段话里的事实）；关闭时原样发送这段话。AI 生成的内容不合规时也回退为这段话。
+                  </p>
+                </div>
+                <div className="flex flex-col gap-4 rounded-lg border bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="space-y-1">
+                    <Label htmlFor="dailyGreetLimit" className="text-base font-medium">每日最多打招呼次数</Label>
+                    <p className="text-sm text-muted-foreground">
+                      按真实发送次数统计，当天达到上限后任务自动停止，次日自动恢复；填 0 表示不限。今日已打招呼：{todayGreetings ?? '—'} 次。
+                    </p>
+                  </div>
+                  <Input
+                    id="dailyGreetLimit"
+                    type="number"
+                    min={0}
+                    className="w-28"
+                    value={config.dailyGreetLimit ?? 20}
+                    onChange={event => setConfig(prev => ({ ...prev, dailyGreetLimit: event.target.value === '' ? 0 : Math.max(0, Number(event.target.value)) }))}
+                  />
+                </div>
                 <div className="flex flex-col gap-4 rounded-lg border bg-muted/20 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="space-y-1">
                     <Label htmlFor="allowRepeatChat" className="text-base font-medium">向已沟通 Boss 再次发送消息</Label>
                     <p className="text-sm text-muted-foreground">
-                      开启后，遇到“继续沟通”会随机发送下方一行消息；关闭时跳过该岗位。首次沟通仍使用 AI 或默认打招呼语。
+                      开启后，遇到“继续沟通”会随机发送下方一行消息；关闭时跳过该岗位。首次沟通发送经过匹配判定的招呼语。
                     </p>
                   </div>
                   <button
@@ -768,13 +968,14 @@ export default function BossPage() {
                     <div>
                       <Label className="text-base font-medium">图片简历</Label>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        支持 PNG、JPG、JPEG、GIF，单张不超过 10MB。重新上传会替换当前图片。
+                        支持 PNG、JPG、JPEG、GIF，单张不超过 10MB，最多 {MAX_RESUME_IMAGE_COUNT} 张，可一次多选。按文件名顺序发送（如 1.jpg、2.jpg），重新上传会替换当前全部图片。
                       </p>
                     </div>
                     <input
                       ref={resumeImageInputRef}
                       type="file"
                       accept="image/png,image/jpeg,image/gif,.png,.jpg,.jpeg,.gif"
+                      multiple
                       onChange={handleResumeImageChange}
                       className="hidden"
                     />
@@ -787,10 +988,15 @@ export default function BossPage() {
                       <BiUpload className="mr-2" />
                       {resumeImageUploading ? '正在上传…' : resumeImage.exists ? '重新上传' : '选择并上传图片'}
                     </Button>
-                    {resumeImage.exists && (
-                      <p className="text-xs text-muted-foreground">
-                        当前文件：{resumeImage.fileName || 'resume'}{resumeImage.size != null ? `（${formatFileSize(resumeImage.size)}）` : ''}
-                      </p>
+                    {savedResumeImages.length > 0 && (
+                      <div className="space-y-0.5 text-xs text-muted-foreground">
+                        <p>当前共 {savedResumeImages.length} 张，按以下顺序发送：</p>
+                        {savedResumeImages.map(item => (
+                          <p key={item.index}>
+                            {item.index}. {item.fileName || 'resume'}{item.size != null ? `（${formatFileSize(item.size)}）` : ''}
+                          </p>
+                        ))}
+                      </div>
                     )}
                     {resumeImageMessage && (
                       <p className={`text-sm ${resumeImageMessage.success ? 'text-green-600' : 'text-red-600'}`}>
@@ -799,7 +1005,7 @@ export default function BossPage() {
                     )}
                   </div>
                   <div className="flex min-h-36 items-center justify-center overflow-hidden rounded-md border bg-background">
-                    {resumePreviewUrl ? (
+                    {resumePreviewUrls.length > 0 ? (
                       <button
                         type="button"
                         onClick={() => setShowResumePreview(true)}
@@ -808,13 +1014,18 @@ export default function BossPage() {
                         title="点击查看大图"
                       >
                         <Image
-                          src={resumePreviewUrl}
+                          src={resumePreviewUrls[0]}
                           alt="图片简历预览"
                           width={220}
                           height={224}
                           unoptimized
                           className="max-h-56 w-full object-contain"
                         />
+                        {resumePreviewUrls.length > 1 && (
+                          <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white">
+                            共 {resumePreviewUrls.length} 张
+                          </span>
+                        )}
                         <span className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-1 bg-black/60 py-1.5 text-xs text-white opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
                           <BiZoomIn className="text-base" /> 点击查看大图
                         </span>
@@ -830,7 +1041,7 @@ export default function BossPage() {
                       自动发送图片简历
                     </Label>
                     <p className="text-sm text-muted-foreground">
-                      开启后，系统会在打招呼语发送成功后发送上方图片；上传图片不会自动开启。
+                      开启后，系统会在打招呼语发送成功后按顺序发送上方全部图片；上传图片不会自动开启。
                     </p>
                     {!resumeImage.exists && (
                       <p className="text-xs text-amber-600">请先上传图片简历，再开启此选项。</p>
@@ -1169,7 +1380,7 @@ export default function BossPage() {
       </Tabs>
 
       {/* 图片简历大图预览 */}
-      {showResumePreview && resumePreviewUrl && createPortal(
+      {showResumePreview && resumePreviewUrls.length > 0 && createPortal(
         <div
           className="fixed inset-0 z-[100] overflow-auto bg-black/85 p-4 backdrop-blur-sm sm:p-8"
           role="dialog"
@@ -1188,23 +1399,56 @@ export default function BossPage() {
           >
             <BiX />
           </button>
-          <div className="flex min-h-full items-start justify-center py-10">
-            <Image
-              src={resumePreviewUrl}
-              alt="图片简历大图"
-              width={1400}
-              height={2000}
-              unoptimized
-              priority
-              className="h-auto w-[94vw] max-w-[1200px] rounded-md bg-white shadow-2xl"
-              onMouseDown={(event) => event.stopPropagation()}
-            />
+          <div className="flex min-h-full flex-col items-center justify-start gap-6 py-10">
+            {resumePreviewUrls.map((url, index) => (
+              <Image
+                key={url}
+                src={url}
+                alt={`图片简历大图 ${index + 1}`}
+                width={1400}
+                height={2000}
+                unoptimized
+                priority={index === 0}
+                className="h-auto w-[94vw] max-w-[1200px] rounded-md bg-white shadow-2xl"
+                onMouseDown={(event) => event.stopPropagation()}
+              />
+            ))}
           </div>
         </div>,
         document.body
       )}
 
       {/* 统计卡片已移除 */}
+      {/* 单次测试弹框 */}
+      {showTestDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white dark:bg-neutral-900 rounded-2xl shadow-2xl w-[92%] max-w-md border border-gray-200 dark:border-neutral-800 animate-in fade-in zoom-in-95">
+            <Card className="border-0">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <BiTestTube className="text-amber-500" />
+                  单次测试
+                </CardTitle>
+                <CardDescription>
+                  先保存当前页面配置，再按配置执行一次投递流程：逐个判定岗位，找到 1 个通过判定的岗位即结束，最多判定 40 个岗位。每个岗位的判定结果显示在“任务状态”卡片中。
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0 space-y-3">
+                <Button disabled={testStarting} onClick={() => handleTestDelivery(true)} className="w-full justify-start h-auto whitespace-normal py-2 text-left" variant="outline">
+                  只评估不发送：走完判定并确认可以发起沟通，不点沟通、不发任何消息
+                </Button>
+                <Button disabled={testStarting} onClick={() => handleTestDelivery(false)} className="w-full justify-start h-auto whitespace-normal py-2 text-left bg-gradient-to-r from-amber-500 to-orange-500 text-white">
+                  真实发送 1 个：对找到的第 1 个匹配岗位发送招呼语和图片简历
+                </Button>
+                <div className="flex justify-end">
+                  <Button variant="ghost" onClick={() => setShowTestDialog(false)} className="rounded-full px-4">取消</Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
       {/* 退出确认弹框 */}
       {showLogoutDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">

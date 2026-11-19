@@ -157,7 +157,7 @@ export default function AiConfigPage() {
                 <BiBrain className="text-primary" />
                 AI配置
               </CardTitle>
-              <CardDescription>配置AI相关的技能介绍和提示词，用于生成个性化求职内容</CardDescription>
+              <CardDescription>技能介绍是 AI 判定岗位是否匹配、生成招呼语的唯一事实来源。开关控制是否使用 AI 按岗位调整的招呼语；无论开关状态，发送前都必须经过 AI 匹配复核</CardDescription>
             </div>
             <div>
               <button
@@ -198,7 +198,7 @@ export default function AiConfigPage() {
                   className="min-h-[150px] resize-y"
                 />
                 <p className="text-xs text-muted-foreground">
-                  AI使用的提示词模板，支持使用 %s 作为占位符，用于动态插入内容
+                  此字段已停用：岗位判定与招呼语改由系统内置的严格判定提示词生成，求职要求请在“Boss直聘 → 岗位匹配规则”中填写
                 </p>
               </div>
             </div>
@@ -221,7 +221,7 @@ export default function AiConfigPage() {
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="text-primary mt-0.5">•</span>
-                    <span><strong>AI提示词：</strong>定义AI生成内容的模板和风格，支持使用 <code className="bg-muted px-1 py-0.5 rounded text-xs">%s</code> 作为占位符</span>
+                    <span><strong>AI提示词：</strong>已停用，求职要求、名称必含词与排除词、匹配分阈值统一在“岗位匹配规则”中配置</span>
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="text-primary mt-0.5">•</span>

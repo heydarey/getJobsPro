@@ -73,3 +73,7 @@ browser-data/
 docs/node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
+
+# 本地运行产物（日志、数据库备份、JDK/Node 运行时）
+.release/
+.tools/
