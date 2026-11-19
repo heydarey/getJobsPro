@@ -39,6 +39,9 @@ public class ZhilianController {
     @Autowired
     private ZhilianJobService zhilianJobService;
 
+    @Autowired
+    private com.getjobs.application.service.BossService bossService;
+
     // ==================== 配置管理相关接口 ====================
 
     /**
@@ -73,6 +76,26 @@ public class ZhilianController {
     @PutMapping("/config")
     public ZhilianConfigEntity updateConfig(@RequestBody ZhilianConfigEntity config) {
         return zhilianService.updateConfig(config);
+    }
+
+    /**
+     * 从 Boss 配置同步关键词与城市（岗位匹配规则本身为两个平台共用，无需同步）。
+     * 入参：无。
+     *
+     * @return Map，success:boolean、message:String、keywords:String、cityName:String、cityCode:String
+     */
+    @PostMapping("/syncFromBoss")
+    public ResponseEntity<Map<String, Object>> syncFromBoss() {
+        Map<String, Object> resp = new HashMap<>();
+        com.getjobs.application.entity.BossConfigEntity boss = bossService.getFirstConfig();
+        if (boss == null) {
+            resp.put("success", false);
+            resp.put("message", "Boss 配置为空，无法同步");
+            return ResponseEntity.badRequest().body(resp);
+        }
+        resp.putAll(zhilianService.syncFromBoss(boss.getKeywords(), boss.getCityCode()));
+        resp.put("success", true);
+        return ResponseEntity.ok(resp);
     }
 
     /**
@@ -262,49 +285,60 @@ public class ZhilianController {
     // ==================== 任务管理相关接口 ====================
 
     /**
-     * 启动智联招聘自动投递任务
-     * @return 响应结果
+     * 启动智联招聘正式投递任务。
+     * 入参：无。
+     *
+     * @return ResponseEntity，success:boolean、message:String、status:String（started / running / not_logged_in）
      */
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startZhilianJob() {
-        Map<String, Object> response = new HashMap<>();
+        return startRun("normal");
+    }
 
+    /**
+     * 单次测试：最多评估 40 个岗位，找到 1 个通过判定的岗位即结束。
+     *
+     * @param dryRun Boolean，可空，默认 true；true 时只评估不投递，false 时对找到的岗位真实投递并打招呼
+     * @return ResponseEntity，见 startZhilianJob 说明
+     */
+    @PostMapping("/testDelivery")
+    public ResponseEntity<Map<String, Object>> testDelivery(@RequestParam(required = false, defaultValue = "true") Boolean dryRun) {
+        return startRun(Boolean.FALSE.equals(dryRun) ? "test" : "testDry");
+    }
+
+    /**
+     * 抢占运行状态并异步启动任务；自检失败等原因写入任务状态的 lastResult。
+     *
+     * @param mode String，必填，normal / test / testDry
+     * @return ResponseEntity，见 startZhilianJob 说明
+     */
+    private ResponseEntity<Map<String, Object>> startRun(String mode) {
+        Map<String, Object> response = new HashMap<>();
         try {
-            // 未登录则不允许启动
             if (!playwrightManager.isLoggedIn("zhilian")) {
                 response.put("success", false);
                 response.put("message", "请先登录智联招聘");
                 response.put("status", "not_logged_in");
                 return ResponseEntity.badRequest().body(response);
             }
-
-            // 检查是否已有任务在运行
-            if (zhilianJobService.isRunning()) {
+            long runId = zhilianJobService.tryAcquire(mode);
+            if (runId == 0L) {
                 response.put("success", false);
-                response.put("message", "智联招聘任务已在运行中，请等待当前任务完成");
+                response.put("message", "智联招聘任务已在运行中，可点“停止投递”后再重新开始");
                 response.put("status", "running");
                 return ResponseEntity.badRequest().body(response);
             }
-
-            // 异步启动新任务
-            CompletableFuture.runAsync(() -> {
-                zhilianJobService.executeDelivery(progressMessage -> {
-                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
-                });
-            });
-
+            CompletableFuture.runAsync(() -> zhilianJobService.runDelivery(runId, mode,
+                    pm -> log.info("[{}] {}", pm.getPlatform(), pm.getMessage())));
             response.put("success", true);
-            response.put("message", "智联招聘任务启动成功");
+            response.put("message", "normal".equals(mode) ? "智联招聘任务启动成功" : "单次测试已启动");
             response.put("status", "started");
-
-            log.info("通过API启动智联招聘任务成功");
+            log.info("通过API启动智联任务，模式：{}", mode);
             return ResponseEntity.ok(response);
-
         } catch (Exception e) {
             log.error("启动智联招聘任务失败", e);
             response.put("success", false);
             response.put("message", "启动智联招聘任务失败: " + e.getMessage());
-            response.put("error", e.getClass().getSimpleName());
             return ResponseEntity.internalServerError().body(response);
         }
     }

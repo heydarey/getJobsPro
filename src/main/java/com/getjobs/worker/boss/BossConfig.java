@@ -106,6 +106,9 @@ public class BossConfig {
      * 是否发送图片简历
      */
     private Boolean sendImgResume;
+    /** 每日最多打招呼次数（真实发送），0 表示不限，默认 20 */
+    private Integer dailyGreetLimit = 20;
+
     /** 允许对“继续沟通”的Boss再次发送消息，默认关闭。 */
     private Boolean allowRepeatChat = false;
 

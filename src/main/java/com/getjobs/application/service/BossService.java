@@ -71,6 +71,25 @@ public class BossService {
             if (tableExists && !names.contains("repeat_chat_messages")) {
                 statement.executeUpdate("ALTER TABLE boss_config ADD COLUMN repeat_chat_messages TEXT");
             }
+            if (tableExists && !names.contains("daily_greet_limit")) {
+                statement.executeUpdate("ALTER TABLE boss_config ADD COLUMN daily_greet_limit INTEGER NOT NULL DEFAULT 20");
+                log.info("已添加每日打招呼上限，默认 20");
+            }
+            // 真实发送流水：每发送一次记一条，用于统计当日打招呼次数
+            statement.executeUpdate("CREATE TABLE IF NOT EXISTS boss_greet_log ("
+                    + "id INTEGER PRIMARY KEY AUTOINCREMENT, greet_date TEXT NOT NULL, encrypt_id TEXT, "
+                    + "job_name TEXT, company_name TEXT, created_at TEXT)");
+            // 投递记录补充“匹配判定原因”列，记录每个岗位为什么发送 / 不发送
+            Set<String> dataCols = new java.util.HashSet<>();
+            try (ResultSet columns = statement.executeQuery("PRAGMA table_info('boss_data')")) {
+                while (columns.next()) {
+                    dataCols.add(columns.getString("name"));
+                }
+            }
+            if (!dataCols.isEmpty() && !dataCols.contains("match_reason")) {
+                statement.executeUpdate("ALTER TABLE boss_data ADD COLUMN match_reason TEXT");
+                log.info("已为 boss_data 添加 match_reason 列");
+            }
         } catch (java.sql.SQLException e) {
             throw new IllegalStateException("无法初始化Boss重复沟通配置", e);
         }
@@ -269,6 +288,7 @@ public class BossService {
         if (partial.getFilterDeadHr() != null) existing.setFilterDeadHr(partial.getFilterDeadHr());
         if (partial.getSendImgResume() != null) existing.setSendImgResume(partial.getSendImgResume());
         if (partial.getAllowRepeatChat() != null) existing.setAllowRepeatChat(partial.getAllowRepeatChat());
+        if (partial.getDailyGreetLimit() != null) existing.setDailyGreetLimit(Math.max(0, partial.getDailyGreetLimit()));
         if (partial.getRepeatChatMessages() != null) existing.setRepeatChatMessages(partial.getRepeatChatMessages());
         if (partial.getWaitTime() != null) existing.setWaitTime(partial.getWaitTime());
 
@@ -322,6 +342,7 @@ public class BossService {
         config.setFilterDeadHR(entity.getFilterDeadHr() != null && entity.getFilterDeadHr() == 1);
         config.setSendImgResume(entity.getSendImgResume() != null && entity.getSendImgResume() == 1);
         config.setAllowRepeatChat(Integer.valueOf(1).equals(entity.getAllowRepeatChat()));
+        config.setDailyGreetLimit(entity.getDailyGreetLimit() == null ? 20 : Math.max(0, entity.getDailyGreetLimit()));
         config.setRepeatChatMessages(entity.getRepeatChatMessages() != null
                 ? entity.getRepeatChatMessages() : BossConfig.DEFAULT_REPEAT_CHAT_MESSAGES);
         config.setWaitTime(entity.getWaitTime() != null ? String.valueOf(entity.getWaitTime()) : null);
@@ -676,6 +697,120 @@ public class BossService {
             uw.eq("encrypt_user_id", encryptUserId);
         }
         bossJobDataMapper.update(update, uw);
+    }
+
+    /**
+     * 更新岗位的投递状态与匹配判定原因。
+     *
+     * @param encryptId     String，必填，岗位 encrypt_id；为空时不更新
+     * @param encryptUserId String，可空，招聘者 encrypt_user_id；为空时只按 encryptId 匹配
+     * @param status        String，必填，投递状态：已投递 / 已过滤 / 投递失败 / 测试通过未发送
+     * @param reason        String，可空，判定原因，最多保存 500 字
+     */
+    public void updateMatchResult(String encryptId, String encryptUserId, String status, String reason) {
+        if (encryptId == null || status == null) return;
+        String r = reason == null ? null : (reason.length() > 500 ? reason.substring(0, 500) : reason);
+        // 已投递表示已经给 HR 发过消息，不允许被后续判定改回其他状态
+        String sql = "UPDATE boss_data SET delivery_status = ?, match_reason = ?, updated_at = ? WHERE encrypt_id = ?"
+                + (encryptUserId != null ? " AND encrypt_user_id = ?" : "")
+                + ("已投递".equals(status) ? "" : " AND (delivery_status IS NULL OR delivery_status <> '已投递')");
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, status);
+            ps.setString(2, r);
+            ps.setString(3, LocalDateTime.now().toString());
+            ps.setString(4, encryptId);
+            if (encryptUserId != null) ps.setString(5, encryptUserId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.warn("更新匹配判定结果失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 记录一次真实打招呼。
+     *
+     * @param encryptId   String，可空，岗位 encrypt_id
+     * @param jobName     String，可空，岗位名称
+     * @param companyName String，可空，公司名称
+     */
+    public void logGreeting(String encryptId, String jobName, String companyName) {
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO boss_greet_log (greet_date, encrypt_id, job_name, company_name, created_at) VALUES (?, ?, ?, ?, ?)")) {
+            ps.setString(1, java.time.LocalDate.now().toString());
+            ps.setString(2, encryptId);
+            ps.setString(3, jobName);
+            ps.setString(4, companyName);
+            ps.setString(5, LocalDateTime.now().toString());
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.warn("记录打招呼流水失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 统计今日已真实打招呼的次数。
+     * 入参：无。
+     *
+     * @return int，今日次数；查询失败时返回 Integer.MAX_VALUE（按已达上限处理，宁可不发）
+     */
+    public int countTodayGreetings() {
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT COUNT(*) FROM boss_greet_log WHERE greet_date = ?")) {
+            ps.setString(1, java.time.LocalDate.now().toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (Exception e) {
+            log.warn("统计今日打招呼次数失败，按已达上限处理：{}", e.getMessage());
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    /**
+     * 判断岗位是否近期已处理过（已发送过，或在截止时间之后已被判定过滤），处理过的岗位本次直接跳过。
+     *
+     * @param encryptId String，可空，岗位 encrypt_id；为空时返回 false
+     * @param cutoff    LocalDateTime，必填，过滤判定的有效起点（取“近 3 天”与“匹配规则最近修改时间”中较晚者）
+     * @return boolean，true 表示近期已处理，应跳过
+     */
+    public boolean isRecentlyProcessed(String encryptId, LocalDateTime cutoff) {
+        if (encryptId == null || encryptId.isBlank()) return false;
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT delivery_status, updated_at FROM boss_data WHERE encrypt_id = ?")) {
+            ps.setString(1, encryptId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String status = rs.getString(1);
+                    if ("已投递".equals(status)) return true;
+                    if ("已过滤".equals(status)) {
+                        LocalDateTime t = parseTime(rs.getString(2));
+                        if (t != null && !t.isBefore(cutoff)) return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("查询岗位处理记录失败：{}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 解析数据库中的时间文本（兼容 “T” 与空格分隔）。
+     *
+     * @param text String，可空，时间文本
+     * @return LocalDateTime，解析失败或为空时返回 null
+     */
+    private static LocalDateTime parseTime(String text) {
+        if (text == null || text.isBlank()) return null;
+        try {
+            return LocalDateTime.parse(text.trim().replace(' ', 'T'));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // ==================== 投递分析（Dashboard）相关方法 ====================

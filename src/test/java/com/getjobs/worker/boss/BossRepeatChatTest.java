@@ -37,6 +37,7 @@ class BossRepeatChatTest {
         when(more.getAttribute("href")).thenReturn("/job_detail/test.html");
         when(listing.context()).thenReturn(context);
         when(context.newPage()).thenReturn(detail);
+        when(listing.waitForPopup(any(Page.WaitForPopupOptions.class), any(Runnable.class))).thenReturn(detail);
         when(detail.locator("a.btn-startchat, a.op-btn-chat")).thenReturn(button);
         when(button.count()).thenReturn(1);
         when(button.first()).thenReturn(button);
@@ -50,7 +51,7 @@ class BossRepeatChatTest {
         when(send.count()).thenReturn(1);
         when(send.first()).thenReturn(send);
         boss.setPage(listing);
-        var submission = Boss.class.getDeclaredMethod("resumeSubmission", String.class, Job.class);
+        var submission = Boss.class.getDeclaredMethod("resumeSubmission", String.class, Job.class, String.class);
         submission.setAccessible(true);
         Job job = new Job();
         if ("继续沟通".equals(text)) job.setJobInfo("已有会话不会调用AI重新分析此JD");
@@ -61,7 +62,8 @@ class BossRepeatChatTest {
                      return new BossChatNavigator.Chat(detail, input, "继续沟通".equals(text));
                  });
              })) {
-            assertEquals(expected, submission.invoke(boss, "Java", job));
+            Object action = submission.invoke(boss, "Java", job, config.getSayHi());
+            assertEquals(expected, "已发送".equals(action));
         }
         verify(button, times(expected ? 1 : 0)).click();
         verify(input, times(expected ? 1 : 0)).fill("继续沟通".equals(text) ? "自定义跟进消息" : config.getSayHi());

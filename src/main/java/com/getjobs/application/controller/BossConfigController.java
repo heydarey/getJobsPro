@@ -257,7 +257,52 @@ public class BossConfigController {
         }
     }
 
-    /** 返回图片内容供管理页面预览。 */
+    /**
+     * 按顺序上传多张图片简历，整体替换当前全部图片；投递时按上传顺序逐张发送。
+     *
+     * @param files List&lt;MultipartFile&gt;，表单字段 files，必填，无默认值；1~5 张 PNG/JPG/GIF，单张不超过 10MB
+     * @return ResponseEntity&lt;Map&gt;；success(boolean)、message(String)、resumeImage(Map，同 GET /api/boss/config 的 resumeImage)
+     */
+    @PostMapping(value = "/resumeImages", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> uploadResumeImages(@RequestParam("files") List<MultipartFile> files) {
+        try {
+            List<ResumeImageInfo> saved = bossResumeImageService.saveAll(files);
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "图片简历上传成功，共 " + saved.size() + " 张",
+                    "resumeImage", bossResumeImageService.getMetadata()
+            ));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "message", e.getMessage()
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "success", false,
+                    "message", "图片简历保存失败：" + e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * 按序号返回图片内容供管理页面预览。
+     *
+     * @param index Integer，queryParam，选填，默认 1；从 1 开始的图片序号
+     * @return ResponseEntity&lt;Resource&gt;，图片二进制；序号不存在时返回 404
+     */
+    @GetMapping("/resumeImages/content")
+    public ResponseEntity<Resource> getResumeImagesContent(@RequestParam(value = "index", defaultValue = "1") Integer index) {
+        return bossResumeImageService.getImage(index == null ? 1 : index)
+                .map(this::resumeImageResponse)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * 返回第 1 张图片内容（兼容旧版管理页面）。
+     *
+     * @return ResponseEntity&lt;Resource&gt;，图片二进制；没有图片时返回 404
+     */
     @GetMapping("/resume-image/content")
     public ResponseEntity<Resource> getResumeImageContent() {
         return bossResumeImageService.getCurrentImage()
@@ -269,7 +314,7 @@ public class BossConfigController {
     public ResponseEntity<Map<String, Object>> handleMaxUploadSizeExceeded() {
         return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(Map.of(
                 "success", false,
-                "message", "图片大小不能超过 10MB"
+                "message", "单张图片不能超过 10MB，且一次上传总大小不能超过 50MB"
         ));
     }
 

@@ -19,6 +19,21 @@ public class PlaywrightUtil {
      *
      * @param seconds 等待的秒数
      */
+    /**
+     * 按毫秒休眠。
+     *
+     * @param millis long，必填，休眠毫秒数；小于等于 0 时不休眠
+     */
+    public static void sleepMillis(long millis) {
+        if (millis <= 0) return;
+        try {
+            TimeUnit.MILLISECONDS.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Sleep被中断", e);
+        }
+    }
+
     public static void sleep(int seconds) {
         try {
             TimeUnit.SECONDS.sleep(seconds);

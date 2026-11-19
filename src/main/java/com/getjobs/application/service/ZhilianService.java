@@ -77,6 +77,11 @@ public class ZhilianService {
         } else {
             config.setSalary(salary);
         }
+        // 投递后行为：未设置时按默认值（发送招呼语、发送图片、每日 20 次）
+        config.setOnlyPartTime(entity.getOnlyPartTime() == null || entity.getOnlyPartTime() != 0);
+        config.setSendGreeting(entity.getSendGreeting() == null || entity.getSendGreeting() != 0);
+        config.setSendImgResume(entity.getSendImgResume() == null || entity.getSendImgResume() != 0);
+        config.setDailyGreetLimit(entity.getDailyGreetLimit() == null ? 20 : Math.max(0, entity.getDailyGreetLimit()));
         return config;
     }
 
@@ -127,6 +132,10 @@ public class ZhilianService {
             toInsert.setKeywords(incoming.getKeywords());
             toInsert.setCityCode(incoming.getCityCode());
             toInsert.setSalary(incoming.getSalary());
+            toInsert.setOnlyPartTime(incoming.getOnlyPartTime());
+            toInsert.setSendGreeting(incoming.getSendGreeting());
+            toInsert.setSendImgResume(incoming.getSendImgResume());
+            toInsert.setDailyGreetLimit(incoming.getDailyGreetLimit());
             toInsert.setCreatedAt(now);
             toInsert.setUpdatedAt(now);
             zhilianConfigMapper.insert(toInsert);
@@ -137,11 +146,72 @@ public class ZhilianService {
             if (incoming.getKeywords() != null) toUpdate.setKeywords(incoming.getKeywords());
             if (incoming.getCityCode() != null) toUpdate.setCityCode(incoming.getCityCode());
             if (incoming.getSalary() != null) toUpdate.setSalary(incoming.getSalary());
+            if (incoming.getOnlyPartTime() != null) toUpdate.setOnlyPartTime(incoming.getOnlyPartTime() == 0 ? 0 : 1);
+            if (incoming.getSendGreeting() != null) toUpdate.setSendGreeting(incoming.getSendGreeting() == 0 ? 0 : 1);
+            if (incoming.getSendImgResume() != null) toUpdate.setSendImgResume(incoming.getSendImgResume() == 0 ? 0 : 1);
+            if (incoming.getDailyGreetLimit() != null) toUpdate.setDailyGreetLimit(Math.max(0, incoming.getDailyGreetLimit()));
             toUpdate.setCreatedAt(first.getCreatedAt());
             toUpdate.setUpdatedAt(now);
             zhilianConfigMapper.updateById(toUpdate);
             return zhilianConfigMapper.selectById(first.getId());
         }
+    }
+
+    /**
+     * 从 Boss 配置同步关键词与城市到智联配置；薪资清空为不限（兼职岗位不按月薪档筛选）。
+     * Boss 的“全国”映射为智联全国代码 489，并在城市选项中补充“全国”。
+     *
+     * @param bossKeywords String，可空，Boss 关键词（JSON 数组文本）；为空时不同步关键词
+     * @param bossCity     String，可空，Boss 城市名称（如“全国”“上海”）
+     * @return Map，keywords:String、cityCode:String、cityName:String、message:String
+     */
+    public java.util.Map<String, String> syncFromBoss(String bossKeywords, String bossCity) {
+        java.util.Map<String, String> result = new java.util.HashMap<>();
+        ZhilianConfigEntity incoming = new ZhilianConfigEntity();
+        if (bossKeywords != null && !bossKeywords.isBlank()) {
+            incoming.setKeywords(bossKeywords);
+        }
+        String city = bossCity == null ? "" : bossCity.trim();
+        if (city.startsWith("[") && city.endsWith("]")) {
+            List<String> cities = parseListString(city);
+            city = cities.isEmpty() ? "" : cities.get(0);
+        }
+        String cityName;
+        if (city.isEmpty() || "全国".equals(city) || "不限".equals(city) || "100010000".equals(city)) {
+            ensureNationwideOption();
+            cityName = "全国";
+        } else if (getCodeByTypeAndName("city", city) != null) {
+            cityName = city;
+        } else {
+            ensureNationwideOption();
+            cityName = "全国";
+            result.put("message", "Boss 城市“" + city + "”在智联城市选项中不存在，已改为全国");
+        }
+        incoming.setCityCode(cityName);
+        incoming.setSalary("");
+        ZhilianConfigEntity saved = saveOrUpdateFirstSelective(incoming);
+        result.putIfAbsent("message", "已从 Boss 同步关键词与城市");
+        result.put("keywords", saved.getKeywords());
+        result.put("cityName", cityName);
+        result.put("cityCode", getCodeByTypeAndName("city", cityName));
+        return result;
+    }
+
+    /**
+     * 确保智联城市选项中存在“全国”（代码 489）。
+     * 入参：无。出参：无。
+     */
+    private void ensureNationwideOption() {
+        if (getCodeByTypeAndName("city", "全国") != null) return;
+        ZhilianOptionEntity e = new ZhilianOptionEntity();
+        e.setType("city");
+        e.setName("全国");
+        e.setCode("489");
+        e.setSortOrder(0);
+        e.setCreatedAt(java.time.LocalDateTime.now());
+        e.setUpdatedAt(java.time.LocalDateTime.now());
+        zhilianOptionMapper.insert(e);
+        log.info("已为智联城市选项补充“全国”（489）");
     }
 
     // ========== Option 辅助 ==========
@@ -199,8 +269,202 @@ public class ZhilianService {
         try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
             stmt.execute(createSql);
             log.info("确保 zhilian_data 表已存在");
+            // 投递记录补充“匹配判定原因”列
+            addColumnIfMissing(stmt, "zhilian_data", "match_reason", "TEXT");
+            // 智联配置补充投递后行为列
+            addColumnIfMissing(stmt, "zhilian_config", "only_part_time", "INTEGER DEFAULT 1");
+            addColumnIfMissing(stmt, "zhilian_config", "send_greeting", "INTEGER DEFAULT 1");
+            addColumnIfMissing(stmt, "zhilian_config", "send_img_resume", "INTEGER DEFAULT 1");
+            addColumnIfMissing(stmt, "zhilian_config", "daily_greet_limit", "INTEGER DEFAULT 20");
+            // 每日打招呼流水，用于每日上限统计
+            stmt.execute("CREATE TABLE IF NOT EXISTS zhilian_greet_log ("
+                    + "id INTEGER PRIMARY KEY AUTOINCREMENT, greet_date TEXT NOT NULL, job_id TEXT, "
+                    + "job_title TEXT, company_name TEXT, created_at TEXT)");
         } catch (Exception e) {
-            log.warn("创建 zhilian_data 表失败: {}", e.getMessage());
+            log.warn("初始化智联数据表失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 表中缺少某列时补充该列，已存在时不做任何改动。
+     *
+     * @param stmt       Statement，必填，可用的语句对象
+     * @param table      String，必填，表名
+     * @param column     String，必填，列名
+     * @param definition String，必填，列定义，例如 "TEXT"、"INTEGER DEFAULT 1"
+     * @throws java.sql.SQLException 执行失败时抛出
+     */
+    private static void addColumnIfMissing(Statement stmt, String table, String column, String definition)
+            throws java.sql.SQLException {
+        java.util.Set<String> cols = new java.util.HashSet<>();
+        try (java.sql.ResultSet rs = stmt.executeQuery("PRAGMA table_info('" + table + "')")) {
+            while (rs.next()) cols.add(rs.getString("name"));
+        }
+        if (!cols.isEmpty() && !cols.contains(column)) {
+            stmt.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+            log.info("已为 {} 添加 {} 列", table, column);
+        }
+    }
+
+    /**
+     * 写入或更新一条岗位记录：job_id 不存在时插入，已存在时只补充空缺的基础信息，不改动投递状态。
+     *
+     * @param entity ZhilianJobDataEntity，必填，jobId 不能为空
+     */
+    public void upsertJob(ZhilianJobDataEntity entity) {
+        if (entity == null || entity.getJobId() == null || entity.getJobId().isBlank()) return;
+        if (!existsByJobId(entity.getJobId())) {
+            insertJob(entity);
+        }
+    }
+
+    /**
+     * 更新岗位的投递状态与匹配判定原因。已投递的记录不会被改为其他状态。
+     *
+     * @param jobId  String，必填，智联岗位编号；为空时不更新
+     * @param status String，必填，投递状态：已投递 / 已过滤 / 未投递 / 投递失败
+     * @param reason String，可空，判定原因，最多保留 500 字
+     */
+    public void updateMatchResult(String jobId, String status, String reason) {
+        if (jobId == null || jobId.isBlank() || status == null) return;
+        String r = reason == null ? null : (reason.length() > 500 ? reason.substring(0, 500) : reason);
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE zhilian_data SET delivery_status = ?, match_reason = ?, update_time = ? "
+                             + "WHERE job_id = ? AND (delivery_status IS NULL OR delivery_status <> '已投递' OR ? = '已投递')")) {
+            ps.setString(1, status);
+            ps.setString(2, r);
+            ps.setString(3, LocalDateTime.now().withNano(0).toString());
+            ps.setString(4, jobId);
+            ps.setString(5, status);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.warn("更新智联岗位判定结果失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 按卡片信息判断岗位是否近期已处理过，口径与 {@link #isRecentlyProcessed(String, LocalDateTime)} 相同。
+     *
+     * @param title    String，可空，岗位名称；为空时返回 false
+     * @param company  String，可空，公司名称；为空时返回 false
+     * @param location String，可空，工作地点；为空时返回 false
+     * @param cutoff   LocalDateTime，必填，过滤判定的有效起点
+     * @return boolean，true 表示近期已处理，应跳过
+     */
+    public boolean isRecentlyProcessedByCard(String title, String company, String location, LocalDateTime cutoff) {
+        if (title == null || title.isBlank() || company == null || company.isBlank()
+                || location == null || location.isBlank()) return false;
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT delivery_status, update_time FROM zhilian_data "
+                             + "WHERE job_title = ? AND company_name = ? AND location = ?")) {
+            ps.setString(1, title);
+            ps.setString(2, company);
+            ps.setString(3, location);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String status = rs.getString(1);
+                    if ("已投递".equals(status)) return true;
+                    if ("已过滤".equals(status)) {
+                        LocalDateTime t = parseTime(rs.getString(2));
+                        if (t != null && !t.isBefore(cutoff)) return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("按卡片查询智联岗位处理记录失败：{}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 判断岗位是否近期已处理过：已投递过，或在截止时间之后已被判定过滤。处理过的岗位本次直接跳过。
+     *
+     * @param jobId  String，可空，智联岗位编号；为空时返回 false
+     * @param cutoff LocalDateTime，必填，过滤判定的有效起点
+     * @return boolean，true 表示近期已处理，应跳过
+     */
+    public boolean isRecentlyProcessed(String jobId, LocalDateTime cutoff) {
+        if (jobId == null || jobId.isBlank()) return false;
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT delivery_status, update_time FROM zhilian_data WHERE job_id = ?")) {
+            ps.setString(1, jobId);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String status = rs.getString(1);
+                    if ("已投递".equals(status)) return true;
+                    if ("已过滤".equals(status)) {
+                        LocalDateTime t = parseTime(rs.getString(2));
+                        if (t != null && !t.isBefore(cutoff)) return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("查询智联岗位处理记录失败：{}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 记录一次真实投递并打招呼，用于每日上限统计。
+     *
+     * @param jobId       String，可空，岗位编号
+     * @param jobTitle    String，可空，岗位名称
+     * @param companyName String，可空，公司名称
+     */
+    public void logGreeting(String jobId, String jobTitle, String companyName) {
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO zhilian_greet_log (greet_date, job_id, job_title, company_name, created_at) VALUES (?, ?, ?, ?, ?)")) {
+            ps.setString(1, java.time.LocalDate.now().toString());
+            ps.setString(2, jobId);
+            ps.setString(3, jobTitle);
+            ps.setString(4, companyName);
+            ps.setString(5, LocalDateTime.now().withNano(0).toString());
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.warn("记录智联打招呼流水失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 统计今日已真实投递并打招呼的次数。
+     * 入参：无。
+     *
+     * @return int，今日次数；查询失败时返回 Integer.MAX_VALUE（按已达上限处理，宁可不发）
+     */
+    public int countTodayGreetings() {
+        try (Connection conn = dataSource.getConnection();
+             java.sql.PreparedStatement ps = conn.prepareStatement(
+                     "SELECT COUNT(*) FROM zhilian_greet_log WHERE greet_date = ?")) {
+            ps.setString(1, java.time.LocalDate.now().toString());
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (Exception e) {
+            log.warn("统计智联今日打招呼次数失败，按已达上限处理：{}", e.getMessage());
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    /**
+     * 解析数据库中的时间文本。
+     *
+     * @param text String，可空，形如 2026-11-02T13:00:00 或 2026-11-02 13:00:00.123
+     * @return LocalDateTime，解析结果；为空或无法解析时返回 null
+     */
+    private static LocalDateTime parseTime(String text) {
+        if (text == null || text.isBlank()) return null;
+        String t = text.trim();
+        try {
+            if (t.chars().allMatch(Character::isDigit)) {
+                return LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(Long.parseLong(t)), java.time.ZoneId.systemDefault());
+            }
+            return LocalDateTime.parse(t.replace(' ', 'T'));
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -233,6 +497,23 @@ public class ZhilianService {
         if (jobId == null || jobId.trim().isEmpty()) return;
         ZhilianJobDataEntity upd = new ZhilianJobDataEntity();
         upd.setDeliveryStatus("已投递");
+        upd.setUpdateTime(LocalDateTime.now());
+        com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ZhilianJobDataEntity> uw =
+                new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<>();
+        uw.eq("job_id", jobId);
+        zhilianJobDataMapper.update(upd, uw);
+    }
+
+    /**
+     * 按 jobId 更新投递状态。
+     *
+     * @param jobId  String，必填，智联岗位 ID；为空时不更新
+     * @param status String，必填，投递状态：已投递 / 已过滤 / 投递失败
+     */
+    public void markStatusByJobId(String jobId, String status) {
+        if (jobId == null || jobId.trim().isEmpty() || status == null) return;
+        ZhilianJobDataEntity upd = new ZhilianJobDataEntity();
+        upd.setDeliveryStatus(status);
         upd.setUpdateTime(LocalDateTime.now());
         com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ZhilianJobDataEntity> uw =
                 new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<>();
