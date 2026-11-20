@@ -64,6 +64,32 @@ export default function Sidebar() {
     }
   }, [])
 
+  // Boss 是否有未处理的风控提醒：有时在菜单 Boss 入口显示红点
+  const [bossRiskAlert, setBossRiskAlert] = useState(false)
+
+  useEffect(() => {
+    /**
+     * 查询 Boss 未处理风控提醒。入参：无。出参：Promise<void>。
+     */
+    const checkRisk = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/boss/riskAlert`)
+        if (!res.ok) return
+        const data = await res.json()
+        setBossRiskAlert(!!data.active)
+      } catch {
+        // 后端不可达时保持当前显示
+      }
+    }
+    checkRisk()
+    const timer = setInterval(checkRisk, 15000)
+    window.addEventListener('bossRiskAlertChanged', checkRisk)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('bossRiskAlertChanged', checkRisk)
+    }
+  }, [])
+
   const envGroup = [
     { href: '/env-config', icon: BiEnvelope, label: '环境配置', color: 'text-cyan-300' },
     { href: '/ai-config', icon: BiBrain, label: 'AI配置', color: 'text-purple-300' },
@@ -212,6 +238,9 @@ export default function Sidebar() {
                   >
                     <Icon className={`text-xl ${isActive ? 'text-cyan-300' : item.color} group-hover:scale-110 transition-transform`} />
                     <span className="font-medium">{item.label}</span>
+                    {item.href === '/boss' && bossRiskAlert && (
+                      <span title="Boss 触发风控，待处理" className="w-2.5 h-2.5 rounded-full bg-red-500 ring-2 ring-white animate-pulse"></span>
+                    )}
                     {isActive && (
                       <div className="ml-auto">
                         <div className="w-2 h-2 bg-cyan-300 rounded-full animate-pulse"></div>

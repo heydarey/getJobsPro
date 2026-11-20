@@ -27,7 +27,7 @@ class CityCodeResolveTest {
      */
     @SuppressWarnings("unchecked")
     private static List<String> boss(List<String> codes) throws Exception {
-        Boss boss = new Boss(null, null, null);
+        Boss boss = new Boss(null, null, null, null);
         BossConfig config = new BossConfig();
         config.setCityCode(codes);
         boss.setConfig(config);

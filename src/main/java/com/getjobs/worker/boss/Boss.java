@@ -1,6 +1,7 @@
 package com.getjobs.worker.boss;
 
 import com.getjobs.application.service.BossResumeImageService;
+import com.getjobs.application.service.BossRiskAlertService;
 import com.getjobs.application.service.BossService;
 import com.getjobs.application.service.JobMatchService;
 import com.getjobs.worker.match.JobCandidate;
@@ -53,6 +54,7 @@ public class Boss {
     private final BossService bossService;
     private final BossResumeImageService bossResumeImageService;
     private final JobMatchService jobMatchService;
+    private final BossRiskAlertService bossRiskAlertService;
 
     /** 本次任务最多实际发送几个岗位，0 表示不限；单次测试时为 1 */
     @Setter
@@ -87,10 +89,18 @@ public class Boss {
     private volatile int titleFilteredCount = 0;
     /** 达到每日打招呼上限时的提示；为 null 表示未达到 */
     private volatile String limitNotice = null;
-    /** 滚动加载：列表每新增一批岗位后的额外停顿范围（毫秒） */
-    private static final long LIST_GROW_PAUSE_MIN = 5_000L, LIST_GROW_PAUSE_MAX = 10_000L;
-    /** 点开岗位后的停留范围（毫秒） */
-    private static final long CARD_VIEW_PAUSE_MIN = 4_000L, CARD_VIEW_PAUSE_MAX = 9_000L;
+    /** 卡片不符合、不点开时的扫视停留范围（毫秒） */
+    private static final long CARD_GLANCE_MIN = 300L, CARD_GLANCE_MAX = 1_000L;
+    /** 点开后一眼看出不合适（HR 不活跃、黑名单）时的停留范围（毫秒） */
+    private static final long QUICK_REJECT_MIN = 1_500L, QUICK_REJECT_MAX = 3_500L;
+    /** 连续多少页没有岗位通过卡片筛选就换下一个关键词 */
+    private static final int MAX_PAGES_WITHOUT_PASS = 3;
+    /** 页面停在风控页超过该时长才判定触发（毫秒），过滤自动跳回的中转校验页 */
+    private static final long RISK_CONFIRM_MILLIS = 4_000L;
+    /** 正在确认风控线索，避免确认期间的等待再次进入检测 */
+    private boolean confirmingRisk = false;
+    /** 等待类停顿的检查间隔（毫秒）：每隔这么久检查一次停止标志与风控 */
+    private static final long STOP_CHECK_INTERVAL = 500L;
     /** 每点开多少个岗位休息一次；近期已处理的岗位不点开，不计入 */
     private static final int REST_EVERY_VIEWED = 30;
     /** 批次休息范围（毫秒） */
@@ -103,6 +113,48 @@ public class Boss {
     private int viewedSinceRest = 0;
     /** 连续取不到详情的岗位数 */
     private int consecutiveMissingDetail = 0;
+    /** 已触发的风控类型；为 null 表示未触发 */
+    private volatile String riskType = null;
+    /** 页面事件回调发现、尚未处理的风控线索：{类型, 地址, 说明} */
+    private volatile String[] pendingRisk = null;
+    /** 待检查返回码的岗位接口返回；事件回调里只入队，不调用 Playwright */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Response> watchedResponses = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** 当前关键词与岗位，写入风控提醒用 */
+    private volatile String currentKeyword = null;
+    private volatile String currentJobName = null;
+    /** 列表页的鼠标 */
+    private HumanMouse mouse;
+    /** 列表页视口高度（像素） */
+    private double viewportHeight = 0;
+    /** 列表接口字段是否已输出过日志 */
+    private boolean listFieldsLogged = false;
+    /** 页面跳转监听：主框架跳到风控页时记下线索 */
+    private final java.util.function.Consumer<Frame> riskNavigationListener = frame -> {
+        try {
+            if (frame.parentFrame() != null) return;
+            String u = frame.url();
+            String type = BossRiskDetector.classifyUrl(u);
+            if (type != null && pendingRisk == null) pendingRisk = new String[]{type, u, "页面跳转到" + type + "页"};
+        } catch (Exception ignore) {
+        }
+    };
+    /**
+     * 接口返回监听：只把岗位列表 / 详情接口入队待检查。脚本、图片等资源请求不参与判断
+     * （Boss 页面正常加载 /web/passport/zp/security-js/*.js，按地址判断会误报）。
+     */
+    private final java.util.function.Consumer<Response> riskResponseListener = resp -> {
+        try {
+            if (BossRiskDetector.isWatchedApi(resp.url())) watchedResponses.add(resp);
+        } catch (Exception ignore) {
+        }
+    };
+    /** 新标签页监听：程序打开的详情页、聊天页同样挂上跳转监听 */
+    private final java.util.function.Consumer<Page> riskPageListener = p -> {
+        try {
+            p.onFrameNavigated(riskNavigationListener);
+        } catch (Exception ignore) {
+        }
+    };
     private Set<String> blackCompanies;
     private Set<String> blackRecruiters;
     private Set<String> blackJobs;
@@ -162,18 +214,267 @@ public class Boss {
      * 执行投递
      */
     public int execute() {
-        for (String cityCode : resolveCityCodes()) {
-            if (stopRequested()) {
-                progressCallback.accept("用户取消投递", 0, 0);
-                break;
+        attachRiskListeners();
+        try {
+            bringBossToFront();
+            for (String cityCode : resolveCityCodes()) {
+                if (stopRequested()) {
+                    progressCallback.accept(stopMessage(), 0, 0);
+                    break;
+                }
+                postJobByCity(cityCode);
+                if (stopRequested()) {
+                    progressCallback.accept(stopMessage(), 0, 0);
+                    break;
+                }
             }
-            postJobByCity(cityCode);
-            if (stopRequested()) {
-                progressCallback.accept("用户取消投递", 0, 0);
-                break;
-            }
+        } finally {
+            detachRiskListeners();
         }
         return resultList.size();
+    }
+
+    /**
+     * 停止时展示的原因：风控或异常中止 > 达到每日上限 > 用户取消。
+     * 入参：无。
+     *
+     * @return String，停止原因
+     */
+    private String stopMessage() {
+        if (abortReason != null) return abortReason;
+        if (limitNotice != null) return limitNotice;
+        return "用户取消投递";
+    }
+
+    /**
+     * 挂上风控监听：列表页与之后新开的标签页的页面跳转、Boss 岗位接口返回。
+     * 入参：无。出参：无。
+     */
+    private void attachRiskListeners() {
+        try {
+            page.onFrameNavigated(riskNavigationListener);
+            page.context().onResponse(riskResponseListener);
+            page.context().onPage(riskPageListener);
+        } catch (Exception e) {
+            log.warn("挂载风控监听失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 摘除风控监听，避免任务结束后仍持有回调。
+     * 入参：无。出参：无。
+     */
+    private void detachRiskListeners() {
+        try {
+            page.offFrameNavigated(riskNavigationListener);
+            page.context().offResponse(riskResponseListener);
+            page.context().offPage(riskPageListener);
+        } catch (Exception e) {
+            log.debug("摘除风控监听失败：{}", e.getMessage());
+        }
+        watchedResponses.clear();
+    }
+
+    /**
+     * 把 Boss 列表页切到前台。
+     * 入参：无。出参：无。
+     */
+    private void bringBossToFront() {
+        try {
+            if (page != null && !page.isClosed()) page.bringToFront();
+        } catch (Exception e) {
+            log.debug("切换 Boss 标签页到前台失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 列表页的鼠标，首次使用时创建。
+     * 入参：无。
+     *
+     * @return HumanMouse，鼠标
+     */
+    private HumanMouse mouse() {
+        if (mouse == null) mouse = new HumanMouse(page);
+        return mouse;
+    }
+
+    /**
+     * 检查风控线索：事件回调记下的跳转、待检查的岗位接口返回、Boss 标签页当前地址。命中即触发风控停止。
+     * 入参：无。出参：无。
+     */
+    private void detectRisk() {
+        if (riskType != null || confirmingRisk) return;
+        Response resp;
+        while ((resp = watchedResponses.poll()) != null) {
+            String body = null;
+            int status;
+            try {
+                status = resp.status();
+            } catch (Exception e) {
+                continue;
+            }
+            if (status >= 200 && status < 300) {
+                try {
+                    body = resp.text();
+                } catch (Exception e) {
+                    continue;
+                }
+            }
+            String problem = BossRiskDetector.classifyApiResponse(status, body);
+            if (problem != null) {
+                String which = BossRiskDetector.isJobListApi(resp.url()) ? "岗位列表接口" : "岗位详情接口";
+                tripRisk(BossRiskDetector.TYPE_API, resp.url(), which + "返回异常：" + problem);
+                return;
+            }
+            if (BossRiskDetector.isJobListApi(resp.url())) recordJobListSample(body);
+        }
+        String[] hit = scanRiskPages();
+        if (hit == null && pendingRisk == null) return;
+        String[] first = hit != null ? hit : pendingRisk;
+        // 平台有时会经过中转校验页、几秒内自动跳回；停在风控页超过确认时长才判定触发，等待期间不做任何操作
+        confirmingRisk = true;
+        try {
+            long deadline = System.currentTimeMillis() + RISK_CONFIRM_MILLIS;
+            while (System.currentTimeMillis() < deadline) {
+                pumpEvents(STOP_CHECK_INTERVAL);
+                hit = scanRiskPages();
+                if (hit == null) {
+                    log.info("页面经过 {}（{}）后已自动离开，不视为风控", first[0], first[1]);
+                    pendingRisk = null;
+                    return;
+                }
+            }
+            tripRisk(hit[0], hit[1], "页面停在" + hit[0] + "页超过 " + RISK_CONFIRM_MILLIS / 1000 + " 秒");
+        } finally {
+            confirmingRisk = false;
+        }
+    }
+
+    /**
+     * 查看 Boss 列表页及 zhipin.com 下其他标签页的当前地址是否为风控页。只读本地记录的地址，不操作页面。
+     * 入参：无。
+     *
+     * @return String[]，{类型, 地址}；没有标签页停在风控页时为 null
+     */
+    private String[] scanRiskPages() {
+        try {
+            if (page == null) return null;
+            List<Page> pages = new ArrayList<>();
+            pages.add(page);
+            if (page.context() != null && page.context().pages() != null) pages.addAll(page.context().pages());
+            for (Page p : pages) {
+                if (p == null || p.isClosed()) continue;
+                String u = p.url();
+                if (p != page && (u == null || !u.contains("zhipin.com"))) continue;
+                String type = BossRiskDetector.classifyUrl(u);
+                if (type != null) return new String[]{type, u};
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
+    }
+
+    /**
+     * 等待一小段时间并让页面事件送达；不检查停止标志（供风控确认期间使用）。
+     *
+     * @param millis long，必填，等待毫秒数
+     */
+    private void pumpEvents(long millis) {
+        try {
+            if (page == null || page.isClosed()) throw new IllegalStateException("页面不可用");
+            page.waitForTimeout(millis);
+        } catch (Exception e) {
+            PlaywrightUtil.sleepMillis(millis);
+        }
+    }
+
+    /**
+     * 按页面标题与正文检查是否是风控页，命中即触发风控停止。只读取页面，不操作页面。
+     *
+     * @param target Page，可空，要检查的标签页
+     * @return boolean，true 表示已触发风控
+     */
+    private boolean checkRiskByPageText(Page target) {
+        if (riskType != null) return true;
+        if (target == null) return false;
+        try {
+            Object raw = target.evaluate("() => { const t = (document.body && document.body.innerText) || '';"
+                    + " return { title: document.title || '', text: t.slice(0, 800), len: t.length }; }");
+            String type = pageTextRiskType(raw);
+            if (type != null) {
+                // 与地址判断一样：过一段时间再看一次，仍是风控提示才判定触发
+                pumpEvents(RISK_CONFIRM_MILLIS);
+                String again = pageTextRiskType(target.evaluate("() => { const t = (document.body && document.body.innerText) || '';"
+                        + " return { title: document.title || '', text: t.slice(0, 800), len: t.length }; }"));
+                if (again != null) {
+                    tripRisk(again, target.url(), "页面内容为" + again + "提示");
+                    return true;
+                }
+                log.info("页面短暂出现{}提示后已恢复，不视为风控：{}", type, target.url());
+            }
+        } catch (Exception e) {
+            log.debug("检查页面内容失败：{}", e.getMessage());
+        }
+        return riskType != null;
+    }
+
+    /**
+     * 按页面标题与正文的读取结果判断风控类型。
+     *
+     * @param raw Object，可空，页面脚本返回的 {title, text, len}
+     * @return String，风控类型；未命中时为 null
+     */
+    private static String pageTextRiskType(Object raw) {
+        if (!(raw instanceof Map<?, ?> m)) return null;
+        Object len = m.get("len");
+        return BossRiskDetector.classifyPageText(String.valueOf(m.get("title")),
+                String.valueOf(m.get("text")), len instanceof Number n ? n.intValue() : Integer.MAX_VALUE);
+    }
+
+    /**
+     * 触发风控停止：置位停止标志、写入风控提醒、推送进度。之后不再点击、刷新、跳转任何页面。
+     *
+     * @param type   String，必填，风控类型
+     * @param url    String，可空，页面或接口地址
+     * @param detail String，必填，触发说明
+     */
+    private void tripRisk(String type, String url, String detail) {
+        if (riskType != null) return;
+        riskType = type;
+        pendingRisk = null;
+        abortReason = "检测到 Boss " + type + "（" + detail + "），投递已立即停止。请在 noVNC 的 Boss 标签页查看并人工处理，"
+                + "处理完后到 Boss 配置页点「我已处理」才能再次启动";
+        log.warn("【风控】{} | 关键词：{} | 岗位：{} | 地址：{} | {}", type, currentKeyword, currentJobName, url, detail);
+        if (bossRiskAlertService != null) {
+            bossRiskAlertService.record(type, url, currentKeyword, currentJobName, detail);
+        }
+        if (progressCallback != null) progressCallback.accept(abortReason, 0, 0);
+    }
+
+    /**
+     * 被动记录页面本来就会加载的岗位列表接口数据，用于核对卡片数据里有没有 HR 活跃时间。
+     * 只保留最近一次，并在每次任务第一次拿到时输出岗位字段名。
+     *
+     * @param body String，可空，列表接口返回
+     */
+    private void recordJobListSample(String body) {
+        if (body == null || body.isBlank()) return;
+        try {
+            java.io.File dir = new java.io.File("target");
+            if (!dir.exists()) dir.mkdirs();
+            java.nio.file.Files.writeString(new java.io.File(dir, "joblist-sample.json").toPath(), body,
+                    StandardCharsets.UTF_8);
+            if (!listFieldsLogged) {
+                JSONObject zpData = new JSONObject(body).optJSONObject("zpData");
+                org.json.JSONArray list = zpData != null ? zpData.optJSONArray("jobList") : null;
+                if (list != null && !list.isEmpty() && list.optJSONObject(0) != null) {
+                    listFieldsLogged = true;
+                    log.info("岗位列表接口单个岗位字段：{}", new TreeSet<>(list.getJSONObject(0).keySet()));
+                }
+            }
+        } catch (Exception e) {
+            log.debug("记录岗位列表接口数据失败：{}", e.getMessage());
+        }
     }
 
     /**
@@ -202,6 +503,7 @@ public class Boss {
      * @return boolean，true 表示应立即停止后续岗位处理
      */
     private boolean stopRequested() {
+        detectRisk();
         if (abortReason != null || limitNotice != null) return true;
         if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) return true;
         if (maxDeliveries > 0 && deliveredCount >= maxDeliveries) return true;
@@ -279,57 +581,65 @@ public class Boss {
      * @param maxMillis long，必填，最长毫秒
      */
     private void restWithStopCheck(long minMillis, long maxMillis) {
-        long end = System.currentTimeMillis() + minMillis
-                + (long) (Math.max(0, maxMillis - minMillis) * ThreadLocalRandom.current().nextDouble());
-        while (System.currentTimeMillis() < end && !stopRequested()) {
-            PlaywrightUtil.sleepMillis(1000);
+        sleepWithStopCheck(minMillis + (long) (Math.max(0, maxMillis - minMillis) * ThreadLocalRandom.current().nextDouble()));
+    }
+
+    /**
+     * 可被打断的等待：每 {@value #STOP_CHECK_INTERVAL} 毫秒检查一次停止标志与风控。
+     * 优先用页面等待，让页面事件（跳转、接口返回）能在等待期间送达；页面不可用时退回线程休眠。
+     *
+     * @param millis long，必填，等待毫秒数，不大于 0 时不等待
+     */
+    private void sleepWithStopCheck(long millis) {
+        long remaining = millis;
+        while (remaining > 0) {
+            if (stopRequested()) return;
+            long chunk = Math.min(STOP_CHECK_INTERVAL, remaining);
+            try {
+                if (page == null || page.isClosed()) throw new IllegalStateException("页面不可用");
+                page.waitForTimeout(chunk);
+            } catch (Exception e) {
+                PlaywrightUtil.sleepMillis(chunk);
+            }
+            remaining -= chunk;
         }
     }
 
     /**
-     * 不点开卡片，按卡片上的岗位名称执行名称规则。
+     * 按卡片上的岗位名称执行名称规则。
      *
-     * @param card Locator，必填，岗位卡片
-     * @return boolean，true 表示名称规则不通过；读不到名称时返回 false，由点开后按详情判定
+     * @param title String，可空，卡片上的岗位名称
+     * @return boolean，true 表示名称规则不通过；名称为空时返回 false，由点开后按详情判定
      */
-    private boolean isRejectedByCardTitle(Locator card) {
+    private boolean isRejectedByCardTitle(String title) {
         try {
-            Locator title = card.locator(".job-name");
-            if (title.count() == 0) return false;
-            String name = title.first().innerText().trim();
-            return !name.isEmpty() && jobMatchService.checkTitle(name) != null;
+            return title != null && !title.isBlank() && jobMatchService.checkTitle(title.trim()) != null;
         } catch (Throwable e) {
             return false;
         }
     }
 
     /**
-     * 当前页面是安全验证页时停止任务并提示人工处理，不再继续操作页面。
+     * 是否已触发风控（含检查页面地址与事件线索）。
+     * 入参：无。
      *
-     * @param keyword String，必填，当前关键词（用于日志）
-     * @return boolean，true 表示已触发验证、任务应立即结束
+     * @return boolean，true 表示已触发风控、任务应立即结束
      */
-    private boolean abortIfSecurityVerify(String keyword) {
-        String url = safeUrl();
-        if (!isSecurityVerifyUrl(url)) return false;
-        if (abortReason == null) {
-            abortReason = "触发 Boss 安全验证，任务已自动停止，请在 noVNC 的 Boss 标签页手动完成验证后再启动";
-            log.warn("【{}】{}，页面：{}", keyword, abortReason, url);
-            progressCallback.accept(abortReason, 0, 0);
-        }
-        return true;
+    private boolean riskTripped() {
+        detectRisk();
+        return riskType != null;
     }
 
     /**
-     * 像人一样的随机停顿：在区间内偏向较短的一端取值，避免均匀分布的机械特征。
+     * 像人一样的随机停顿：在区间内偏向较短的一端取值，避免均匀分布的机械特征；等待期间可被停止或风控打断。
      *
      * @param minMillis long，必填，最短毫秒
      * @param maxMillis long，必填，最长毫秒；不大于 minMillis 时按 minMillis 停顿
      */
-    private static void humanPause(long minMillis, long maxMillis) {
+    private void humanPause(long minMillis, long maxMillis) {
         long span = Math.max(0, maxMillis - minMillis);
         double r = Math.pow(ThreadLocalRandom.current().nextDouble(), 1.6);
-        PlaywrightUtil.sleepMillis(minMillis + (long) (span * r));
+        sleepWithStopCheck(minMillis + (long) (span * r));
     }
 
     /**
@@ -479,386 +789,580 @@ public class Boss {
         return result;
     }
 
+    /**
+     * 按城市逐个关键词浏览岗位列表。
+     *
+     * @param cityCode String，必填，城市代码
+     */
     private void postJobByCity(String cityCode) {
         String searchUrl = getSearchUrl(cityCode);
         boolean firstKeyword = true;
         for (String keyword : config.getKeywords()) {
             if (!firstKeyword) restWithStopCheck(KEYWORD_REST_MIN, KEYWORD_REST_MAX);
             firstKeyword = false;
-            // 检查是否需要停止
             if (stopRequested()) {
-                progressCallback.accept("用户取消投递", 0, 0);
+                progressCallback.accept(stopMessage(), 0, 0);
                 return;
             }
-
-            int postCount = 0;
-            // 使用 URLEncoder 对关键词进行编码
+            currentKeyword = keyword;
+            currentJobName = null;
             String encodedKeyword = URLEncoder.encode(keyword, StandardCharsets.UTF_8);
-
             String url = searchUrl + (searchUrl.contains("?") ? "&" : "?") + "query=" + encodedKeyword;
-            // 单个关键词失败不该让整个投递任务中止，下面整段都包在 try 里
+            // 单个关键词失败不该让整个投递任务中止；风控触发时 stopRequested 为真，直接结束
             try {
-            // 进列表页 + 等列表渲染，整段带重试
-            openJobListWithRetry(keyword, url, cityCode);
-
-            // 1. 基于 footer 出现滚动到底，确保加载全部岗位
-            int lastCount = -1;
-            int stableTries = 0;
-            int staleHits = 0;
-            // 上限 300 轮：原来写的是 5000，而且 stableTries 只触发强制触底、从不退出循环，
-            // 一旦 footer 选择器匹配不到就会空转几千轮，每轮一次 evaluate + count，
-            // 能把 playwright 线程占死几十分钟 —— 整个应用跟着卡住、投递任务也永远结束不了。
-            boolean loadedAll = false;
-            for (int i = 0; i < 300; i++) {
-                // 停止检查：滚动加载过程中也要及时响应
-                if (stopRequested()) {
-                    progressCallback.accept("用户取消投递", 0, 0);
-                    return;
-                }
-                if (abortIfSecurityVerify(keyword)) return;
-                // 滚动加载期间 Boss 会频繁增删 frame，Playwright 派发这些事件时可能
-                // 引用到已销毁的 frame（Object doesn't exist: frame@...），异常会顺着
-                // 当时在飞的那个调用抛出来。这类异常和调用本身无关，跳过这一轮继续滚就行。
-                try {
-                    // footer 可见不能立刻就当作"加载完了"：窗口最大化时首屏很短，
-                    // 第一轮 footer 就是可见的，会导致只拿到首屏 15 个岗位就退出
-                    // （实测同样的搜索条件，正常滚完是 300 个）。
-                    // 必须先滚一段、并且连着几轮没有新增岗位，footer 才算数。
-                    boolean footerVisible = false;
-                    Locator footer = page.locator("div#footer, #footer");
-                    if (footer.count() > 0 && footer.first().isVisible()) {
-                        footerVisible = true;
-                    }
-                    if (footerVisible && stableTries >= 2) {
-                        log.info("【{}】已滚动到底部且连续 {} 轮无新增，判定加载完毕", keyword, stableTries);
-                        loadedAll = true;
-                        break;
-                    }
-                    // 按 0.6~1.2 个视口随机幅度滚动，每次之间像人一样停一下
-                    double ratio = 0.6 + ThreadLocalRandom.current().nextDouble() * 0.6;
-                    page.evaluate("r => window.scrollBy(0, Math.floor(window.innerHeight * r))", ratio);
-                    humanPause(2000, 4000);
-
-                    // 获取卡片数量变化，判断是否需要强制触底
-                    Locator cardsProbe = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
-                    int currentCount = cardsProbe.count();
-                    if (currentCount == lastCount) {
-                        stableTries++;
-                    } else {
-                        stableTries = 0;
-                        humanPause(LIST_GROW_PAUSE_MIN, LIST_GROW_PAUSE_MAX);
-                    }
-                    lastCount = currentCount;
-
-                    if (stableTries >= 3) { // 连续多次无新增，则强制触底一次
-                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
-                        // 触底不再等待，继续检测 footer 出现
-                    }
-                    // 强制触底之后仍然连着好几轮没有新岗位，就认定加载完了。
-                    // 不能只靠 footer —— Boss 有些版式根本没有 #footer，只等它就是死循环。
-                    if (stableTries >= 8) {
-                        log.info("【{}】连续 {} 轮没有新增岗位，判定已加载完毕", keyword, stableTries);
-                        loadedAll = true;
-                        break;
-                    }
-                } catch (Exception e) {
-                    if (!isStaleObjectError(e)) {
-                        throw e;
-                    }
-                    staleHits++;
-                    if (staleHits > 20) {
-                        log.warn("【{}】滚动期间反复出现失效对象异常({}次)，停止继续加载", keyword, staleHits);
-                        break;
-                    }
-                    PlaywrightUtil.sleep(1);
-                }
-            }
-            if (!loadedAll) {
-                log.warn("【{}】滚动到达 300 轮上限仍未确认加载完毕，按当前已加载的岗位继续", keyword);
-            }
-            // 统计最终岗位数量
-            int loadedCount = countJobCards();
-            log.info("【{}】岗位已全部加载，总数:{}", keyword, loadedCount);
-            progressCallback.accept("岗位加载完成：" + keyword, 0, loadedCount);
-
-            // 2. 回到页面顶部
-            page.evaluate("window.scrollTo(0, 0);");
-            humanPause(1000, 2000);
-
-            // 3. 逐个查看搜索结果中的全部岗位，是否投递由匹配闸门决定
-            Locator cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
-            int count = cards.count();
-            for (int i = 0; i < count; i++) {
-                // 检查是否需要停止
-                if (stopRequested()) {
-                    progressCallback.accept(limitNotice != null ? limitNotice : "用户取消投递", i, count);
-                    return;
-                }
-
-                if (abortIfSecurityVerify(keyword)) return;
-                // 重新获取卡片，避免元素过期
-                cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
-                // 卡片上能取到岗位编号时，近期处理过的岗位不点开，直接跳过
-                String cardEncryptId = null;
-                try {
-                    Locator link = cards.nth(i).locator("a[href*='/job_detail/']");
-                    if (link.count() > 0) cardEncryptId = encryptIdFromHref(link.first().getAttribute("href"));
-                } catch (Throwable ignore) {
-                }
-                if (cardEncryptId != null && bossService.isRecentlyProcessed(cardEncryptId, processedCutoff)) {
-                    skippedOldCount++;
-                    continue;
-                }
-                if (isRejectedByCardTitle(cards.nth(i))) {
-                    titleFilteredCount++;
-                    continue;
-                }
-                // 在点击卡片时同步等待岗位详情接口返回，随后解析并入库
-                Response detailResp = null;
-                try {
-                    if (i == 0 && count > 1) {
-                        // 第一个卡片默认展开不会触发请求：先切到第二个，再切回第一个，并在返回第一个时监听响应
-                        final Locator secondCard = cards.nth(1);
-                        secondCard.click();
-                        PlaywrightUtil.sleep(1);
-                        final Locator firstCard = cards.nth(0);
-                        detailResp = page.waitForResponse(r -> {
-                            try {
-                                return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
-                                        && "GET".equalsIgnoreCase(r.request().method());
-                            } catch (Throwable ignore) { return false; }
-                        }, firstCard::click);
-                    } else {
-                        final Locator cardToClick = cards.nth(i);
-                        detailResp = page.waitForResponse(r -> {
-                            try {
-                                return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
-                                        && "GET".equalsIgnoreCase(r.request().method());
-                            } catch (Throwable ignore) { return false; }
-                        }, cardToClick::click);
-                    }
-                } catch (Throwable ignore) {
-                }
-                // 点开后像人一样看一会儿岗位信息
-                humanPause(CARD_VIEW_PAUSE_MIN, CARD_VIEW_PAUSE_MAX);
-                if (++viewedSinceRest >= REST_EVERY_VIEWED) {
-                    viewedSinceRest = 0;
-                    log.info("已点开 {} 个岗位，批次休息", REST_EVERY_VIEWED);
-                    restWithStopCheck(BATCH_REST_MIN, BATCH_REST_MAX);
-                    if (stopRequested()) return;
-                }
-
-                // 统一从请求返回的 JSON 中获取数据并做过滤
-                String jobName = null;
-                String jobSalary = null;
-                java.util.List<String> tags = new java.util.ArrayList<>();
-                String jobDesc = null;
-                String bossName = null;
-                String bossActive = null;
-                String bossCompany = null;
-                String bossJobTitle = null;
-                String jobEncryptId = null;
-                String jobEncryptUserId = null;
-
-                if (detailResp != null) {
-                    try {
-                        String body = detailResp.text();
-                        if (cardEncryptId == null) {
-                            org.json.JSONObject probe = new org.json.JSONObject(body).optJSONObject("zpData");
-                            org.json.JSONObject probeJob = probe != null ? probe.optJSONObject("jobInfo") : null;
-                            String probeId = probeJob != null ? probeJob.optString("encryptId", null) : null;
-                            if (probeId != null && bossService.isRecentlyProcessed(probeId, processedCutoff)) {
-                                skippedOldCount++;
-                                continue;
-                            }
-                        }
-                        newJobCount++;
-                        // 保存原始 JSON 便于调试
-                        appendRawJson(body);
-                        // 解析并入库（仅在点击卡片触发时执行）
-                        processJobDetailJsonAndInsert(body);
-
-                        // 从 JSON 构建用于投递与过滤的字段
-                        org.json.JSONObject root = new org.json.JSONObject(body);
-                        org.json.JSONObject zpData = root.optJSONObject("zpData");
-                        org.json.JSONObject jobInfo = zpData != null ? zpData.optJSONObject("jobInfo") : null;
-                        org.json.JSONObject brand = zpData != null ? zpData.optJSONObject("brandComInfo") : null;
-                        org.json.JSONObject boss = zpData != null ? zpData.optJSONObject("bossInfo") : null;
-
-                        if (jobInfo != null) {
-                            jobName = jobInfo.optString("jobName", "");
-                            jobSalary = jobInfo.optString("salaryDesc", "");
-                            String city = jobInfo.optString("locationName", "");
-                            String exp = jobInfo.optString("experienceName", "");
-                            String deg = jobInfo.optString("degreeName", "");
-                            if (!city.isEmpty()) tags.add(city);
-                            if (!exp.isEmpty()) tags.add(exp);
-                            if (!deg.isEmpty()) tags.add(deg);
-                            jobDesc = jobInfo.optString("postDescription", "");
-                            jobEncryptId = jobInfo.optString("encryptId", null);
-                            jobEncryptUserId = jobInfo.optString("encryptUserId", null);
-                        }
-
-                        if (boss != null) {
-                            bossName = boss.optString("name", "");
-                            bossActive = boss.optString("activeTimeDesc", "");
-                            bossJobTitle = boss.optString("title", "");
-                        }
-
-                        if (brand != null) {
-                            bossCompany = brand.optString("brandName", "");
-                        }
-                    } catch (Throwable e) {
-                        log.debug("点击卡片后解析岗位详情用于过滤失败：{}", e.getMessage());
-                    }
-                }
-
-                // 取不到详情时不判定：多半是页面被拦，继续点只会增加风险
-                if (jobName == null || jobName.isBlank()) {
-                    consecutiveMissingDetail++;
-                    log.warn("【{}】第 {} 个岗位详情未取到（连续 {} 个）", keyword, i + 1, consecutiveMissingDetail);
-                    if (abortIfSecurityVerify(keyword)) return;
-                    if (consecutiveMissingDetail >= MAX_MISSING_DETAIL) {
-                        abortReason = "连续 " + consecutiveMissingDetail + " 个岗位详情取不到，可能触发平台校验，任务已自动停止，请在 noVNC 查看 Boss 页面";
-                        log.warn(abortReason);
-                        progressCallback.accept(abortReason, i + 1, count);
-                        return;
-                    }
-                    continue;
-                }
-                consecutiveMissingDetail = 0;
-
-                // 过滤（全部基于 JSON 字段），并输出过滤原因
-                if (jobName != null && blackJobs != null && blackJobs.stream().anyMatch(jobName::contains)) {
-                    String term = findMatchedTerm(blackJobs, jobName);
-                    log.info("被过滤：职位黑名单命中 | 公司：{} | 岗位：{} | 关键词：{}", bossCompany != null ? bossCompany : "", jobName, term != null ? term : "");
-                    recordEvaluation(jobName, bossCompany, jobSalary, "黑名单", "职位黑名单命中：" + term, null, null, "已过滤");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤", "黑名单：职位黑名单命中 " + term);
-                    continue;
-                }
-                // HR活跃状态过滤：当开启过滤开关且活跃描述包含“年”时，视为不活跃
-                boolean hrInactiveByYear = bossActive != null && bossActive.contains("年");
-                if (Boolean.TRUE.equals(config.getFilterDeadHR()) && hrInactiveByYear) {
-                    log.info("被过滤：HR活跃状态包含‘年’ | 公司：{} | 岗位：{} | 活跃：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossActive);
-                    recordEvaluation(jobName, bossCompany, jobSalary, "HR活跃度", "HR 不活跃：" + bossActive, null, null, "已过滤");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤", "HR活跃度：" + bossActive);
-                    continue;
-                }
-                if (bossCompany != null && blackCompanies != null && blackCompanies.stream().anyMatch(bossCompany::contains)) {
-                    String term = findMatchedTerm(blackCompanies, bossCompany);
-                    log.info("被过滤：公司黑名单命中 | 公司：{} | 岗位：{} | 关键词：{}", bossCompany, jobName != null ? jobName : "", term != null ? term : "");
-                    recordEvaluation(jobName, bossCompany, jobSalary, "黑名单", "公司黑名单命中：" + term, null, null, "已过滤");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤", "黑名单：公司黑名单命中 " + term);
-                    continue;
-                }
-                if (bossJobTitle != null && blackRecruiters != null && blackRecruiters.stream().anyMatch(bossJobTitle::contains)) {
-                    String term = findMatchedTerm(blackRecruiters, bossJobTitle);
-                    log.info("被过滤：招聘者黑名单命中 | 公司：{} | 岗位：{} | 招聘者：{} | 关键词：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossJobTitle, term != null ? term : "");
-                    recordEvaluation(jobName, bossCompany, jobSalary, "黑名单", "招聘者黑名单命中：" + term, null, null, "已过滤");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤", "黑名单：招聘者黑名单命中 " + term);
-                    continue;
-                }
-
-                // 匹配闸门：发送前必须通过。规则 / AI 任一环节不通过或出错都不发送。
-                // 必须放在点击“立即沟通”之前：Boss 打开沟通本身就可能触发平台侧的自动打招呼。
-                evaluatedCount++;
-                progressCallback.accept("正在判定：" + (jobName != null ? jobName : "（岗位信息缺失）"), i + 1, count);
-                MatchDecision decision = jobMatchService.evaluate(
-                        new JobCandidate("boss", keyword, jobName, bossCompany, jobSalary, String.join(", ", tags), jobDesc),
-                        config.getSayHi(), Boolean.TRUE.equals(config.getEnableAI()));
-                if (decision.aiUnavailable()) {
-                    // AI 不可用：本岗位不发送，也不记为“已过滤”（岗位本身未被判定），记为未投递
-                    consecutiveAiErrors++;
-                    log.warn("AI 不可用，本岗位不发送（连续 {} 次） | 公司：{} | 岗位：{} | 原因：{}",
-                            consecutiveAiErrors, bossCompany, jobName, decision.reason());
-                    recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(), decision.reason(),
-                            null, null, "AI不可用未发送");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "未投递", decision.reason());
-                    if (consecutiveAiErrors >= MAX_CONSECUTIVE_AI_ERRORS) {
-                        abortReason = "AI 连续 " + consecutiveAiErrors + " 次不可用，任务已自动停止，未发送任何消息。最后一次原因："
-                                + decision.reason();
-                        log.error(abortReason);
-                        progressCallback.accept(abortReason, i + 1, count);
-                        return;
-                    }
-                    continue;
-                }
-                consecutiveAiErrors = 0;
-                if (!decision.pass()) {
-                    log.info("匹配判定不通过 | 环节：{} | 公司：{} | 岗位：{} | 原因：{}",
-                            decision.stage(), bossCompany, jobName, decision.reason());
-                    recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(), decision.reason(),
-                            decision.score(), null, "已过滤");
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤",
-                            decision.stage() + "：" + decision.reason());
-                    continue;
-                }
-                log.info("匹配判定通过 | 分数：{} | 公司：{} | 岗位：{} | 原因：{}",
-                        decision.score(), bossCompany, jobName, decision.reason());
-                Map<String, Object> evaluation = recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(),
-                        decision.reason(), decision.score(), decision.greeting(), "处理中");
-
-                // 创建Job对象（全部基于 JSON 字段）
-                Job job = new Job();
-                job.setJobName(jobName != null ? jobName : "");
-                job.setSalary(jobSalary != null ? jobSalary : "");
-                job.setJobArea(String.join(", ", tags));
-                job.setCompanyName(bossCompany != null ? bossCompany : "");
-                job.setRecruiter(bossName != null ? bossName : "");
-                job.setJobInfo(jobDesc != null ? jobDesc : "");
-
-                // 输出
-                progressCallback.accept("正在投递：" + jobName, i + 1, count);
-                String action = resumeSubmission(keyword, job, decision.greeting());
-                evaluation.put("action", action);
-                if (action.startsWith("已发送")) {
-                    postCount++;
-                    deliveredCount++;
-                    bossService.logGreeting(jobEncryptId, jobName, bossCompany);
-                    Integer limit = config.getDailyGreetLimit();
-                    if (limit != null && limit > 0) {
-                        int today = bossService.countTodayGreetings();
-                        if (today >= limit) {
-                            limitNotice = "今日已打招呼 " + today + " 次，达到每日上限 " + limit + " 次，任务已自动停止";
-                            log.info(limitNotice);
-                        }
-                    }
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已投递",
-                            "通过（" + decision.score() + " 分）：" + decision.reason());
-                } else if ("测试通过未发送".equals(action)) {
-                    bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "未投递",
-                            "单次测试通过（未发送，" + decision.score() + " 分）：" + decision.reason());
-                }
-                if (dryRun && "测试通过未发送".equals(action)) {
-                    // 只评估模式下，找到一个可发送岗位即视为完成一次测试
-                    deliveredCount++;
-                }
-                if (stopRequested()) {
-                    String why = limitNotice != null ? limitNotice
-                            : (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) ? "已按停止指令结束"
-                            : "已达到本次任务的发送数量，结束";
-                    progressCallback.accept(why, i + 1, count);
-                    return;
-                }
-
-                // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑
-                try {
-                    if (i >= 5) {
-                        page.evaluate("window.scrollBy(0, 140);");
-                        PlaywrightUtil.sleep(1);
-                    }
-                } catch (Throwable ignore) {}
-
-                // 按 wait_time 降速，别把风控刷出来
-                pauseBetweenJobs();
-            }
-            log.info("【{}】岗位已投递完毕！已投递岗位数量:{}", keyword, postCount);
+                browseKeyword(keyword, url, cityCode);
             } catch (Exception e) {
+                if (stopRequested()) return;
                 log.error("【{}】处理失败，跳过该关键词继续下一个：{}", keyword, e.getMessage(), e);
                 if (progressCallback != null) {
                     progressCallback.accept("关键词[" + keyword + "]失败已跳过：" + e.getMessage(), 0, 0);
                 }
             }
+            if (stopRequested()) return;
+        }
+    }
+
+    /**
+     * 像真人一样浏览一个关键词的搜索结果：只处理已加载的一批卡片，从上往下逐个看；
+     * 当前一批看完后用滚轮向下滚动加载下一页，不预加载、不回到顶部。
+     * 平台没有更多岗位，或连续 {@value #MAX_PAGES_WITHOUT_PASS} 页没有岗位通过卡片筛选时，结束该关键词。
+     *
+     * @param keyword  String，必填，搜索关键词
+     * @param url      String，必填，搜索结果页地址
+     * @param cityCode String，必填，城市代码
+     */
+    private void browseKeyword(String keyword, String url, String cityCode) {
+        openJobListWithRetry(keyword, url, cityCode);
+        if (stopRequested() || checkRiskByPageText(page)) return;
+        viewportHeight = mouse().viewport()[1];
+        // 页面打开后先扫一眼
+        humanPause(1500, 3500);
+
+        int deliveredBefore = deliveredCount;
+        int next = 0;
+        int pageNo = 0;
+        int pagesWithoutPass = 0;
+        while (!stopRequested()) {
+            int count = countJobCards();
+            if (next >= count) {
+                if (!loadMoreByWheel(keyword, count)) {
+                    log.info("【{}】没有更多岗位，结束该关键词", keyword);
+                    break;
+                }
+                continue;
+            }
+            pageNo++;
+            boolean anyPass = false;
+            log.info("【{}】第 {} 页：第 {} ~ {} 个岗位", keyword, pageNo, next + 1, count);
+            progressCallback.accept("正在浏览：" + keyword + " 第 " + pageNo + " 页", next, count);
+            for (; next < count; next++) {
+                if (stopRequested()) {
+                    progressCallback.accept(stopMessage(), next, count);
+                    return;
+                }
+                CardResult result = handleCard(keyword, next, count);
+                if (result == CardResult.STOP) {
+                    if (stopRequested()) progressCallback.accept(stopMessage(), next + 1, count);
+                    return;
+                }
+                if (result == CardResult.OPENED) anyPass = true;
+            }
+            pagesWithoutPass = anyPass ? 0 : pagesWithoutPass + 1;
+            if (pagesWithoutPass >= MAX_PAGES_WITHOUT_PASS) {
+                log.info("【{}】连续 {} 页没有岗位通过卡片筛选，换下一个关键词", keyword, pagesWithoutPass);
+                break;
+            }
+        }
+        log.info("【{}】浏览结束，本关键词发送 {} 个", keyword, deliveredCount - deliveredBefore);
+    }
+
+    /** 单张卡片的处理结果 */
+    private enum CardResult {
+        /** 卡片不符合，未点开 */
+        SKIPPED,
+        /** 卡片通过筛选并已点开（无论后续是否发送） */
+        OPENED,
+        /** 应结束当前关键词（停止指令、风控、达到上限、AI 不可用等） */
+        STOP
+    }
+
+    /**
+     * 处理一张岗位卡片：先看卡片，不符合的不点开；通过的点开看右侧岗位信息，
+     * HR 活跃度与招聘者不通过则看下一个；否则读完岗位描述交给匹配闸门，通过后进入沟通流程。
+     *
+     * @param keyword String，必填，当前关键词
+     * @param i       int，必填，卡片序号（从 0 开始）
+     * @param count   int，必填，当前已加载的卡片总数
+     * @return CardResult，处理结果
+     */
+    private CardResult handleCard(String keyword, int i, int count) {
+        Locator card = jobCards().nth(i);
+        currentJobName = null;
+        scrollIntoViewByWheel(card);
+        if (stopRequested()) return CardResult.STOP;
+
+        // 1. 先看卡片：名称规则、职位 / 公司黑名单、近期已处理，不符合的不点开
+        Map<String, String> info = readCard(card);
+        String cardTitle = info.getOrDefault("title", "");
+        String cardCompany = info.getOrDefault("company", "");
+        String cardEncryptId = encryptIdFromHref(info.get("href"));
+        currentJobName = cardTitle;
+        String skip = null;
+        if (cardEncryptId != null && bossService.isRecentlyProcessed(cardEncryptId, processedCutoff)) {
+            skippedOldCount++;
+            skip = "近期已处理";
+        } else if (isRejectedByCardTitle(cardTitle)) {
+            titleFilteredCount++;
+            skip = "名称规则不通过";
+        } else {
+            String hit = cardBlacklistHit(cardTitle, cardCompany, blackJobs, blackCompanies);
+            if (hit != null) {
+                titleFilteredCount++;
+                skip = hit;
+            }
+        }
+        if (skip != null) {
+            log.debug("【{}】卡片未点开：{} | {} | {}", keyword, cardTitle, cardCompany, skip);
+            if (ThreadLocalRandom.current().nextDouble() < 0.3) mouse().hover(card);
+            humanPause(CARD_GLANCE_MIN, CARD_GLANCE_MAX);
+            return CardResult.SKIPPED;
+        }
+
+        // 2. 点开卡片，右侧显示岗位信息
+        Response detailResp = clickCardForDetail(card, i, count);
+        if (stopRequested()) return CardResult.STOP;
+        viewedSinceRest++;
+
+        String jobName = null;
+        String jobSalary = null;
+        java.util.List<String> tags = new java.util.ArrayList<>();
+        String jobDesc = null;
+        String bossName = null;
+        String bossActive = null;
+        String bossCompany = null;
+        String bossJobTitle = null;
+        String jobEncryptId = null;
+        String jobEncryptUserId = null;
+
+        if (detailResp != null) {
+            String body = null;
+            try {
+                body = detailResp.text();
+            } catch (Throwable e) {
+                log.debug("读取岗位详情返回失败：{}", e.getMessage());
+            }
+            String problem = BossRiskDetector.classifyApiResponse(detailResp.status(), body);
+            if (problem != null) {
+                tripRisk(BossRiskDetector.TYPE_API, detailResp.url(), "岗位详情接口返回异常：" + problem);
+                return CardResult.STOP;
+            }
+            try {
+                if (cardEncryptId == null && body != null) {
+                    org.json.JSONObject probe = new org.json.JSONObject(body).optJSONObject("zpData");
+                    org.json.JSONObject probeJob = probe != null ? probe.optJSONObject("jobInfo") : null;
+                    String probeId = probeJob != null ? probeJob.optString("encryptId", null) : null;
+                    if (probeId != null && bossService.isRecentlyProcessed(probeId, processedCutoff)) {
+                        skippedOldCount++;
+                        humanPause(CARD_GLANCE_MIN, CARD_GLANCE_MAX);
+                        return CardResult.OPENED;
+                    }
+                }
+                if (body != null) {
+                    newJobCount++;
+                    appendRawJson(body);
+                    processJobDetailJsonAndInsert(body);
+
+                    org.json.JSONObject root = new org.json.JSONObject(body);
+                    org.json.JSONObject zpData = root.optJSONObject("zpData");
+                    org.json.JSONObject jobInfo = zpData != null ? zpData.optJSONObject("jobInfo") : null;
+                    org.json.JSONObject brand = zpData != null ? zpData.optJSONObject("brandComInfo") : null;
+                    org.json.JSONObject boss = zpData != null ? zpData.optJSONObject("bossInfo") : null;
+                    if (jobInfo != null) {
+                        jobName = jobInfo.optString("jobName", "");
+                        jobSalary = jobInfo.optString("salaryDesc", "");
+                        String city = jobInfo.optString("locationName", "");
+                        String exp = jobInfo.optString("experienceName", "");
+                        String deg = jobInfo.optString("degreeName", "");
+                        if (!city.isEmpty()) tags.add(city);
+                        if (!exp.isEmpty()) tags.add(exp);
+                        if (!deg.isEmpty()) tags.add(deg);
+                        jobDesc = jobInfo.optString("postDescription", "");
+                        jobEncryptId = jobInfo.optString("encryptId", null);
+                        jobEncryptUserId = jobInfo.optString("encryptUserId", null);
+                    }
+                    if (boss != null) {
+                        bossName = boss.optString("name", "");
+                        bossActive = boss.optString("activeTimeDesc", "");
+                        bossJobTitle = boss.optString("title", "");
+                    }
+                    if (brand != null) {
+                        bossCompany = brand.optString("brandName", "");
+                    }
+                }
+            } catch (Throwable e) {
+                log.debug("点击卡片后解析岗位详情用于过滤失败：{}", e.getMessage());
+            }
+        }
+
+        // 取不到详情时不判定：多半是页面被拦，继续点只会增加风险
+        if (jobName == null || jobName.isBlank()) {
+            consecutiveMissingDetail++;
+            log.warn("【{}】第 {} 个岗位详情未取到（连续 {} 个）", keyword, i + 1, consecutiveMissingDetail);
+            if (stopRequested() || checkRiskByPageText(page)) return CardResult.STOP;
+            if (consecutiveMissingDetail >= MAX_MISSING_DETAIL) {
+                abortReason = "连续 " + consecutiveMissingDetail + " 个岗位详情取不到，可能触发平台校验，任务已自动停止，请在 noVNC 查看 Boss 页面";
+                log.warn(abortReason);
+                progressCallback.accept(abortReason, i + 1, count);
+                return CardResult.STOP;
+            }
+            humanPause(CARD_GLANCE_MIN, CARD_GLANCE_MAX);
+            return CardResult.OPENED;
+        }
+        consecutiveMissingDetail = 0;
+        currentJobName = jobName;
+
+        // 3. 右侧岗位信息里一眼能看出不合适的：黑名单、HR 不活跃，稍看一下就换下一个
+        String quickReject = null;
+        String quickStage = "黑名单";
+        if (blackJobs != null && blackJobs.stream().anyMatch(jobName::contains)) {
+            quickReject = "职位黑名单命中：" + findMatchedTerm(blackJobs, jobName);
+        } else if (Boolean.TRUE.equals(config.getFilterDeadHR()) && bossActive != null && bossActive.contains("年")) {
+            quickStage = "HR活跃度";
+            quickReject = "HR 不活跃：" + bossActive;
+        } else if (bossCompany != null && blackCompanies != null && blackCompanies.stream().anyMatch(bossCompany::contains)) {
+            quickReject = "公司黑名单命中：" + findMatchedTerm(blackCompanies, bossCompany);
+        } else if (bossJobTitle != null && blackRecruiters != null && blackRecruiters.stream().anyMatch(bossJobTitle::contains)) {
+            quickReject = "招聘者黑名单命中：" + findMatchedTerm(blackRecruiters, bossJobTitle);
+        }
+        if (quickReject != null) {
+            log.info("被过滤：{} | 公司：{} | 岗位：{}", quickReject, bossCompany != null ? bossCompany : "", jobName);
+            recordEvaluation(jobName, bossCompany, jobSalary, quickStage, quickReject, null, null, "已过滤");
+            bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤", quickStage + "：" + quickReject);
+            humanPause(QUICK_REJECT_MIN, QUICK_REJECT_MAX);
+            restIfNeeded();
+            return stopRequested() ? CardResult.STOP : CardResult.OPENED;
+        }
+
+        // 4. 按岗位描述长度阅读一会儿，再交给匹配闸门
+        readJobDetail(jobDesc == null ? 0 : jobDesc.length());
+        if (stopRequested()) return CardResult.STOP;
+        restIfNeeded();
+        if (stopRequested()) return CardResult.STOP;
+
+        // 匹配闸门：发送前必须通过。规则 / AI 任一环节不通过或出错都不发送。
+        // 必须放在点击“立即沟通”之前：Boss 打开沟通本身就可能触发平台侧的自动打招呼。
+        evaluatedCount++;
+        progressCallback.accept("正在判定：" + jobName, i + 1, count);
+        MatchDecision decision = jobMatchService.evaluate(
+                new JobCandidate("boss", keyword, jobName, bossCompany, jobSalary, String.join(", ", tags), jobDesc),
+                config.getSayHi(), Boolean.TRUE.equals(config.getEnableAI()));
+        if (decision.aiUnavailable()) {
+            // AI 不可用：本岗位不发送，也不记为“已过滤”（岗位本身未被判定），记为未投递
+            consecutiveAiErrors++;
+            log.warn("AI 不可用，本岗位不发送（连续 {} 次） | 公司：{} | 岗位：{} | 原因：{}",
+                    consecutiveAiErrors, bossCompany, jobName, decision.reason());
+            recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(), decision.reason(),
+                    null, null, "AI不可用未发送");
+            bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "未投递", decision.reason());
+            if (consecutiveAiErrors >= MAX_CONSECUTIVE_AI_ERRORS) {
+                abortReason = "AI 连续 " + consecutiveAiErrors + " 次不可用，任务已自动停止，未发送任何消息。最后一次原因："
+                        + decision.reason();
+                log.error(abortReason);
+                progressCallback.accept(abortReason, i + 1, count);
+                return CardResult.STOP;
+            }
+            return CardResult.OPENED;
+        }
+        consecutiveAiErrors = 0;
+        if (!decision.pass()) {
+            log.info("匹配判定不通过 | 环节：{} | 公司：{} | 岗位：{} | 原因：{}",
+                    decision.stage(), bossCompany, jobName, decision.reason());
+            recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(), decision.reason(),
+                    decision.score(), null, "已过滤");
+            bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已过滤",
+                    decision.stage() + "：" + decision.reason());
+            pauseBetweenJobs();
+            return stopRequested() ? CardResult.STOP : CardResult.OPENED;
+        }
+        log.info("匹配判定通过 | 分数：{} | 公司：{} | 岗位：{} | 原因：{}",
+                decision.score(), bossCompany, jobName, decision.reason());
+        Map<String, Object> evaluation = recordEvaluation(jobName, bossCompany, jobSalary, decision.stage(),
+                decision.reason(), decision.score(), decision.greeting(), "处理中");
+
+        Job job = new Job();
+        job.setJobName(jobName);
+        job.setSalary(jobSalary != null ? jobSalary : "");
+        job.setJobArea(String.join(", ", tags));
+        job.setCompanyName(bossCompany != null ? bossCompany : "");
+        job.setRecruiter(bossName != null ? bossName : "");
+        job.setJobInfo(jobDesc != null ? jobDesc : "");
+
+        // 5. AI 通过后打开详情页沟通；详情页关闭后把 Boss 列表页切回前台
+        progressCallback.accept("正在投递：" + jobName, i + 1, count);
+        String action = resumeSubmission(keyword, job, decision.greeting());
+        bringBossToFront();
+        evaluation.put("action", action);
+        if (action.startsWith("已发送")) {
+            deliveredCount++;
+            bossService.logGreeting(jobEncryptId, jobName, bossCompany);
+            Integer limit = config.getDailyGreetLimit();
+            if (limit != null && limit > 0) {
+                int today = bossService.countTodayGreetings();
+                if (today >= limit) {
+                    limitNotice = "今日已打招呼 " + today + " 次，达到每日上限 " + limit + " 次，任务已自动停止";
+                    log.info(limitNotice);
+                }
+            }
+            bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "已投递",
+                    "通过（" + decision.score() + " 分）：" + decision.reason());
+        } else if ("测试通过未发送".equals(action)) {
+            bossService.updateMatchResult(jobEncryptId, jobEncryptUserId, "未投递",
+                    "单次测试通过（未发送，" + decision.score() + " 分）：" + decision.reason());
+        }
+        if (dryRun && "测试通过未发送".equals(action)) {
+            // 只评估模式下，找到一个可发送岗位即视为完成一次测试
+            deliveredCount++;
+        }
+        if (stopRequested()) {
+            String why = abortReason != null ? abortReason : limitNotice != null ? limitNotice
+                    : (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) ? "已按停止指令结束"
+                    : "已达到本次任务的发送数量，结束";
+            progressCallback.accept(why, i + 1, count);
+            return CardResult.STOP;
+        }
+        // 按 wait_time 降速，别把风控刷出来
+        pauseBetweenJobs();
+        return stopRequested() ? CardResult.STOP : CardResult.OPENED;
+    }
+
+    /**
+     * 点开卡片数达到批次阈值时休息一会儿。
+     * 入参：无。出参：无。
+     */
+    private void restIfNeeded() {
+        if (viewedSinceRest < REST_EVERY_VIEWED) return;
+        viewedSinceRest = 0;
+        log.info("已点开 {} 个岗位，批次休息", REST_EVERY_VIEWED);
+        restWithStopCheck(BATCH_REST_MIN, BATCH_REST_MAX);
+    }
+
+    /**
+     * 当前列表页的全部岗位卡片。
+     * 入参：无。
+     *
+     * @return Locator，岗位卡片集合
+     */
+    private Locator jobCards() {
+        return page.locator(JOB_LIST_SELECTOR);
+    }
+
+    /**
+     * 一次读出卡片上的岗位名称、公司名称与岗位链接。
+     *
+     * @param card Locator，必填，岗位卡片
+     * @return Map&lt;String, String&gt;，title、company、href，取不到的为空字符串
+     */
+    private Map<String, String> readCard(Locator card) {
+        Map<String, String> info = new HashMap<>();
+        try {
+            Object raw = card.evaluate("el => { const q = s => { const n = el.querySelector(s);"
+                    + " return n ? (n.innerText || n.textContent || '').trim() : ''; };"
+                    + " const a = el.querySelector(\"a[href*='/job_detail/']\");"
+                    + " return { title: q('.job-name'), company: q('.boss-name') || q('.company-name'),"
+                    + " href: a ? (a.getAttribute('href') || '') : '' }; }");
+            if (raw instanceof Map<?, ?> m) {
+                for (Map.Entry<?, ?> e : m.entrySet()) {
+                    info.put(String.valueOf(e.getKey()), e.getValue() == null ? "" : String.valueOf(e.getValue()));
+                }
+            }
+        } catch (Exception e) {
+            log.debug("读取卡片信息失败：{}", e.getMessage());
+        }
+        return info;
+    }
+
+    /**
+     * 卡片上的职位名称、公司名称是否命中黑名单。
+     *
+     * @param title          String，可空，卡片上的岗位名称
+     * @param company        String，可空，卡片上的公司名称
+     * @param blackJobs      Set&lt;String&gt;，可空，职位黑名单
+     * @param blackCompanies Set&lt;String&gt;，可空，公司黑名单
+     * @return String，命中说明；未命中时为 null
+     */
+    static String cardBlacklistHit(String title, String company, Set<String> blackJobs, Set<String> blackCompanies) {
+        if (title != null && !title.isBlank() && blackJobs != null) {
+            for (String term : blackJobs) {
+                if (term != null && !term.isBlank() && title.contains(term)) return "职位黑名单命中：" + term;
+            }
+        }
+        if (company != null && !company.isBlank() && blackCompanies != null) {
+            for (String term : blackCompanies) {
+                if (term != null && !term.isBlank() && company.contains(term)) return "公司黑名单命中：" + term;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 用鼠标点开卡片并等待右侧岗位详情接口返回。第一个卡片默认已展开、点击不会触发请求，
+     * 因此先点第二个再点回第一个。
+     *
+     * @param card  Locator，必填，要点开的卡片
+     * @param i     int，必填，卡片序号
+     * @param count int，必填，已加载卡片数
+     * @return Response，岗位详情接口返回；超时或失败时为 null
+     */
+    private Response clickCardForDetail(Locator card, int i, int count) {
+        java.util.function.Predicate<Response> isDetail = r -> {
+            try {
+                return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
+                        && "GET".equalsIgnoreCase(r.request().method());
+            } catch (Throwable ignore) {
+                return false;
+            }
+        };
+        try {
+            if (i == 0 && count > 1) {
+                mouse().click(jobCards().nth(1), this::humanPause);
+                humanPause(800, 1800);
+                if (stopRequested()) return null;
+            }
+            return page.waitForResponse(isDetail, new Page.WaitForResponseOptions().setTimeout(10_000),
+                    () -> mouse().click(card, this::humanPause));
+        } catch (Throwable e) {
+            log.debug("点开卡片未等到岗位详情：{}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 按岗位描述长度估算阅读时间并停留；描述较长时偶尔把鼠标移到右侧详情上往下滚一点。
+     *
+     * @param descLength int，必填，岗位描述字数
+     */
+    private void readJobDetail(int descLength) {
+        long total = readingMillis(descLength, ThreadLocalRandom.current());
+        if (descLength > 400 && ThreadLocalRandom.current().nextDouble() < 0.5) {
+            try {
+                Locator panel = page.locator(".job-detail-box, .job-detail-container").first();
+                if (panel.count() > 0) {
+                    long first = total / 3;
+                    sleepWithStopCheck(first);
+                    if (stopRequested()) return;
+                    mouse().hover(panel);
+                    mouse().wheel(150 + ThreadLocalRandom.current().nextInt(250), this::humanPause);
+                    total -= first;
+                }
+            } catch (Exception e) {
+                log.debug("滚动岗位详情失败：{}", e.getMessage());
+            }
+        }
+        sleepWithStopCheck(total);
+    }
+
+    /**
+     * 按岗位描述长度估算的阅读停留时间：按每秒 18~28 字略读，限制在 2.5~15 秒，再加 0.5~2.5 秒随机量。
+     *
+     * @param descLength int，必填，岗位描述字数
+     * @param random     Random，必填，随机数源
+     * @return long，停留毫秒数，范围 3000~17500
+     */
+    static long readingMillis(int descLength, Random random) {
+        double charsPerSecond = 18 + random.nextDouble() * 10;
+        long read = (long) (Math.max(0, descLength) / charsPerSecond * 1000);
+        read = Math.max(2_500L, Math.min(15_000L, read));
+        return read + 500 + (long) (random.nextDouble() * 2_000);
+    }
+
+    /**
+     * 卡片不在可视区域时，把鼠标放到列表上用滚轮滚过去，不用脚本滚动。
+     *
+     * @param target Locator，必填，要看的卡片
+     */
+    private void scrollIntoViewByWheel(Locator target) {
+        for (int round = 0; round < 6; round++) {
+            com.microsoft.playwright.options.BoundingBox box;
+            try {
+                box = target.boundingBox(new Locator.BoundingBoxOptions().setTimeout(3_000));
+            } catch (Exception e) {
+                return;
+            }
+            if (box == null) return;
+            double vh = viewportHeight > 0 ? viewportHeight : 800;
+            if (box.y >= vh * 0.12 && box.y + box.height <= vh - 30) return;
+            double targetY = vh * (0.3 + ThreadLocalRandom.current().nextDouble() * 0.25);
+            int delta = (int) (box.y - targetY);
+            if (Math.abs(delta) < 20) return;
+            moveMouseOverList();
+            mouse().wheel(delta, this::humanPause);
+            humanPause(250, 700);
+            if (stopRequested()) return;
+        }
+    }
+
+    /**
+     * 鼠标不在岗位列表上时移过去，保证滚轮滚的是列表而不是右侧详情。
+     * 入参：无。出参：无。
+     */
+    private void moveMouseOverList() {
+        try {
+            com.microsoft.playwright.options.BoundingBox list = page.locator("ul.rec-job-list").first()
+                    .boundingBox(new Locator.BoundingBoxOptions().setTimeout(2_000));
+            if (list == null) return;
+            double vh = viewportHeight > 0 ? viewportHeight : 800;
+            double[] pos = mouse().position();
+            boolean inside = pos[0] >= list.x + 10 && pos[0] <= list.x + list.width - 10
+                    && pos[1] >= vh * 0.15 && pos[1] <= vh * 0.9;
+            if (inside) return;
+            double x = list.x + list.width * (0.25 + ThreadLocalRandom.current().nextDouble() * 0.5);
+            double y = vh * (0.4 + ThreadLocalRandom.current().nextDouble() * 0.3);
+            mouse().moveTo(x, y);
+        } catch (Exception e) {
+            log.debug("移动鼠标到岗位列表失败：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 当前一批看完后，用滚轮分几次向下滚动，等平台加载下一页。
+     *
+     * @param keyword     String，必填，当前关键词（用于日志）
+     * @param countBefore int，必填，滚动前的卡片数
+     * @return boolean，true 表示加载出了新卡片；到底后仍没有新卡片时为 false
+     */
+    private boolean loadMoreByWheel(String keyword, int countBefore) {
+        int bottomHits = 0;
+        for (int round = 0; round < 15; round++) {
+            if (stopRequested()) return false;
+            moveMouseOverList();
+            mouse().wheel(250 + ThreadLocalRandom.current().nextInt(350), this::humanPause);
+            humanPause(600, 1500);
+            int now = countJobCards();
+            if (now > countBefore) {
+                log.info("【{}】滚动加载了下一页：{} → {}", keyword, countBefore, now);
+                humanPause(800, 2000);
+                return true;
+            }
+            if (atPageBottom()) {
+                if (++bottomHits >= 3) return false;
+                humanPause(1000, 2000);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 页面是否已滚到底。
+     * 入参：无。
+     *
+     * @return boolean，true 表示已到底；读取失败时为 false
+     */
+    private boolean atPageBottom() {
+        try {
+            Object r = page.evaluate("() => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 8");
+            return Boolean.TRUE.equals(r);
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -1268,11 +1772,11 @@ public class Boss {
                 return;
             } catch (RuntimeException e) {
                 last = e;
-                if (abortIfSecurityVerify(keyword)) throw e;
+                if (riskTripped()) throw e;
                 log.warn("【{}】进入岗位列表失败（第{}/2次）：{}", keyword, attempt,
                         e.getMessage() == null ? e.toString() : e.getMessage().split("\n")[0]);
                 if (attempt < 2) {
-                    PlaywrightUtil.sleep(3);
+                    sleepWithStopCheck(3_000);
                 }
             }
         }
@@ -1361,10 +1865,13 @@ public class Boss {
     }
 
     /**
-     * 落地后检查是否被弹到风控/验证页，日志里能直接看出是哪一步触发的。
+     * 落地后检查是否被弹到风控页（访问受限、安全验证），命中时抛出异常结束当前关键词。
+     *
+     * @param keyword String，必填，当前关键词（仅用于日志）
      */
     private void warnIfSecurityCheck(String keyword) {
-        if (abortIfSecurityVerify(keyword)) {
+        if (riskTripped() || checkRiskByPageText(page)) {
+            log.warn("【{}】打开岗位列表后发现风控页", keyword);
             throw new IllegalStateException(abortReason);
         }
     }
@@ -1411,7 +1918,7 @@ public class Boss {
         try {
             moreInfoBtn.first().evaluate("el => { el.target = '_blank'; }");
             detailPage = page.waitForPopup(new Page.WaitForPopupOptions().setTimeout(10_000),
-                    () -> moreInfoBtn.first().click());
+                    () -> mouse().click(moreInfoBtn.first(), this::humanPause));
         } catch (Throwable e) {
             log.warn("点击“查看更多信息”未打开详情页，跳过该岗位：{}", e.getMessage());
             return "已跳过";
@@ -1420,19 +1927,32 @@ public class Boss {
             log.warn("点击“查看更多信息”未打开详情页，跳过该岗位");
             return "已跳过";
         }
-        try (BossChatNavigator navigator = new BossChatNavigator(detailPage)) {
+        // 风控触发后不关闭任何页面，验证页、受限页原样保留给人工处理
+        try (BossChatNavigator navigator = new BossChatNavigator(detailPage, () -> riskType != null)) {
             try {
                 detailPage.waitForLoadState(com.microsoft.playwright.options.LoadState.DOMCONTENTLOADED,
                         new Page.WaitForLoadStateOptions().setTimeout(LOAD_STATE_TIMEOUT));
             } catch (Throwable ignore) {
             }
-            // 像人一样在详情页看一会儿，随手往下滚一点
+            if (stopRequested() || checkRiskByPageText(detailPage)) {
+                closeOwnedPage(detailPage);
+                return "已跳过";
+            }
+            // 像人一样在详情页看一会儿，把鼠标移到正文上往下滚一点
             humanPause(1500, 3000);
             try {
-                detailPage.mouse().wheel(0, 200 + ThreadLocalRandom.current().nextInt(400));
+                HumanMouse detailMouse = new HumanMouse(detailPage);
+                double[] size = detailMouse.viewport();
+                detailMouse.moveTo(size[0] * (0.3 + ThreadLocalRandom.current().nextDouble() * 0.3),
+                        size[1] * (0.4 + ThreadLocalRandom.current().nextDouble() * 0.3));
+                detailMouse.wheel(200 + ThreadLocalRandom.current().nextInt(400), this::humanPause);
             } catch (Throwable ignore) {
             }
             humanPause(1500, 3000);
+            if (stopRequested()) {
+                closeOwnedPage(detailPage);
+                return "已跳过";
+            }
 
             // 3. 根据开关选择是否允许对已沟通过的Boss再次发送消息
             Locator chatBtn = detailPage.locator("a.btn-startchat, a.op-btn-chat");
@@ -1442,7 +1962,7 @@ public class Boss {
             for (int i = 0; i < 5; i++) {
                 if (stopRequested()) {
                     log.info("停止指令已触发，结束查找聊天按钮 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
-                    try { detailPage.close(); } catch (Exception ignore) {}
+                    closeOwnedPage(detailPage);
                     return "已跳过";
                 }
                 if (chatBtn.count() > 0) {
@@ -1450,7 +1970,7 @@ public class Boss {
                     if (buttonText != null && buttonText.contains("继续沟通")
                             && !Boolean.TRUE.equals(config.getAllowRepeatChat())) {
                         log.info("已关闭重复沟通，跳过已沟通Boss | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
-                        try { detailPage.close(); } catch (Exception ignore) {}
+                        closeOwnedPage(detailPage);
                         return "已沟通跳过";
                     }
                     if (buttonText != null && (buttonText.contains("立即沟通")
@@ -1460,35 +1980,33 @@ public class Boss {
                         break;
                     }
                 }
-                PlaywrightUtil.sleep(1);
+                sleepWithStopCheck(1_000);
             }
             if (!foundChatBtn) {
                 log.warn("未找到可用的沟通按钮，跳过岗位: {}", job.getJobName());
                 // 关闭详情页
-                try {
-                    detailPage.close();
-                } catch (Exception ignore) {
-                }
+                closeOwnedPage(detailPage);
                 return "已跳过";
             }
             if (dryRun) {
                 // 只评估模式：确认岗位可以发起沟通即结束，不点击沟通、不发送任何内容
                 log.info("单次测试（只评估）：岗位通过判定且可发起沟通，未发送 | 公司：{} | 岗位：{} | 招呼语：{}",
                         job.getCompanyName(), job.getJobName(), greeting);
-                try { detailPage.close(); } catch (Exception ignore) {}
+                closeOwnedPage(detailPage);
                 return "测试通过未发送";
             }
             if (repeatChat) {
                 repeatMessage = config.randomRepeatChatMessage();
                 if (repeatMessage == null) {
                     log.info("重复沟通消息列表为空，跳过岗位：{}", job.getJobName());
-                    try { detailPage.close(); } catch (Exception ignore) {}
+                    closeOwnedPage(detailPage);
                     return "已跳过";
                 }
             }
             BossChatNavigator.Chat chat = navigator.open(chatBtn.first(), repeatChat,
-                    Boolean.TRUE.equals(config.getAllowRepeatChat()), shouldStopCallback, 20_000);
+                    Boolean.TRUE.equals(config.getAllowRepeatChat()), this::stopRequested, 20_000);
             if (chat == null) return "已跳过";
+            if (stopRequested() || checkRiskByPageText(chat.page())) return "已跳过";
             detailPage = chat.page();
             repeatChat = chat.repeat();
             // 重复沟通状态由岗位按钮决定，通知框本身不代表旧会话。
@@ -1505,11 +2023,12 @@ public class Boss {
             String message = repeatChat ? repeatMessage : greeting;
             if (!isValidString(message)) {
                 log.warn("招呼语为空，不发送 | 岗位：{}", job.getJobName());
-                try { detailPage.close(); } catch (Exception ignore) {}
+                closeOwnedPage(detailPage);
                 return "已跳过";
             }
 
             // 6. 输入打招呼语
+            if (stopRequested()) return "已跳过";
             Locator input = inputLocator.first();
             input.click();
             Object tagObj = input.evaluate("el => el.tagName.toLowerCase()");
@@ -1523,6 +2042,7 @@ public class Boss {
             // 7. 点击发送按钮（div.send-message 或 button.btn-send）
             Locator sendText = detailPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
             boolean sendSuccess = false;
+            if (stopRequested()) return "已跳过";
             if (sendText.count() > 0) {
                 sendText.first().click();
                 PlaywrightUtil.sleep(1);
@@ -1540,11 +2060,8 @@ public class Boss {
             log.info("投递完成 | 公司：{} | 岗位：{} | 薪资：{} | 招呼语：{} | 图片简历：{}", job.getCompanyName(), job.getJobName(), job.getSalary(), message, imgResume ? "已发送" : "未发送");
 
             // 9. 关闭新打开的详情页
-            try {
-                detailPage.close();
-            } catch (Exception ignore) {
-            }
-            PlaywrightUtil.sleep(1);
+            closeOwnedPage(detailPage);
+            humanPause(600, 1400);
 
             // 10. 更新数据库投递状态 & 成功投递加入结果
             if (sendSuccess) {
@@ -1581,6 +2098,24 @@ public class Boss {
     }
 
     
+
+    /**
+     * 关闭程序自己打开的详情页 / 聊天页；风控已触发或页面停在风控页时不关闭，留给人工处理。
+     *
+     * @param target Page，可空，要关闭的标签页
+     */
+    private void closeOwnedPage(Page target) {
+        if (target == null) return;
+        try {
+            if (target.isClosed()) return;
+            if (riskType != null || BossRiskDetector.classifyUrl(target.url()) != null) {
+                log.info("风控已触发或页面为风控页，保留该标签页：{}", target.url());
+                return;
+            }
+            target.close();
+        } catch (Exception ignore) {
+        }
+    }
 
     /**
      * 注册页面响应监听：拦截 /wapi/zpgeek/job/detail.json 请求并解析写库
@@ -2175,7 +2710,7 @@ public class Boss {
     private void pauseBetweenJobs() {
         int waitTime = resolveWaitTimeSeconds();
         if (Boolean.TRUE.equals(config.getDebugger())) {
-            PlaywrightUtil.sleep(waitTime);
+            sleepWithStopCheck(waitTime * 1000L);
             return;
         }
         long base = waitTime * 1000L;
@@ -2186,22 +2721,6 @@ public class Boss {
         }
     }
 
-    /**
-     * 判断是不是 Boss 的安全验证页。
-     * <p>
-     * 实测密集遍历后会被弹到 /web/passport/zp/verify.html（极验滑块，页面上是
-     * div.geetest_success_correct 那一套），而原来的判断只认 verify-slider，
-     * 导致真正遇到验证时程序把关键词当失败跳过，人也不知道要去过验证。
-     */
-    private static boolean isSecurityVerifyUrl(String url) {
-        if (url == null) {
-            return false;
-        }
-        return url.contains("/web/user/safe/verify-slider")
-                || url.contains("/web/passport/zp/verify")
-                || url.contains("/web/passport/zp/security")
-                || url.contains("security-check");
-    }
 
     private boolean isLoginRequired() {
         try {

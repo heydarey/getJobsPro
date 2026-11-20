@@ -6,7 +6,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import Image from 'next/image'
 import { createSSEWithBackoff } from '@/lib/sse'
 import { createPortal } from 'react-dom'
-import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut, BiImage, BiUpload, BiZoomIn, BiX, BiTestTube, BiListCheck } from 'react-icons/bi'
+import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut, BiImage, BiUpload, BiZoomIn, BiX, BiTestTube, BiListCheck, BiError } from 'react-icons/bi'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -18,6 +18,18 @@ import AnalysisContent from '@/app/boss/analysis/AnalysisContent'
 import { API_BASE } from '@/lib/api'
 import MatchRuleCard, { MatchRuleCardHandle } from '@/app/components/MatchRuleCard'
 import EvaluationList, { EvaluationItem } from '@/app/components/EvaluationList'
+
+/** 未处理的 Boss 风控提醒，字段与后端 BossRiskAlertService.getActiveAlert 一致 */
+interface RiskAlert {
+  id?: number
+  alertType?: string
+  pageUrl?: string
+  keyword?: string
+  jobName?: string
+  detail?: string
+  createdAt?: string
+  unhandledCount?: number
+}
 
 interface BossConfig {
   id?: number
@@ -140,6 +152,10 @@ export default function BossPage() {
   const [todayGreetings, setTodayGreetings] = useState<number | null>(null)
   const [lastResult, setLastResult] = useState<{ mode?: string; success?: boolean; message?: string; finishedAt?: string } | null>(null)
   const [showTestDialog, setShowTestDialog] = useState(false)
+  // 未处理的风控提醒：存在时禁止开始投递与单次测试，直到管理员点「我已处理」
+  const [riskAlert, setRiskAlert] = useState<RiskAlert | null>(null)
+  const [showRiskAckDialog, setShowRiskAckDialog] = useState(false)
+  const [riskAcking, setRiskAcking] = useState(false)
   const [testStarting, setTestStarting] = useState(false)
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
@@ -248,6 +264,7 @@ export default function BossPage() {
       setEvaluations(Array.isArray(data.evaluations) ? data.evaluations : [])
       setTodayGreetings(typeof data.todayGreetings === 'number' ? data.todayGreetings : null)
       setLastResult(data.lastResult && Object.keys(data.lastResult).length > 0 ? data.lastResult : null)
+      setRiskAlert(data.riskAlert ?? null)
     } catch {
       // 网络抖动时保持当前显示，下一轮再同步
     }
@@ -771,6 +788,31 @@ export default function BossPage() {
     }
   }
 
+  /**
+   * 管理员确认已在 noVNC 中处理完风控，解除启动限制，并通知侧边栏刷新红点。
+   * 入参：无。出参：Promise<void>。
+   */
+  const handleAckRiskAlert = async () => {
+    setRiskAcking(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/boss/riskAlert/acknowledge`, { method: 'POST' })
+      const data = await response.json()
+      if (!data.success) {
+        setSaveResult({ success: false, title: '确认失败', message: data.message || '确认失败，请查看后端日志' })
+        setShowSaveDialog(true)
+        return
+      }
+      setShowRiskAckDialog(false)
+      window.dispatchEvent(new Event('bossRiskAlertChanged'))
+      await syncRunStatus()
+    } catch {
+      setSaveResult({ success: false, title: '确认失败', message: `无法连接后端服务（${API_BASE}）` })
+      setShowSaveDialog(true)
+    } finally {
+      setRiskAcking(false)
+    }
+  }
+
   const triggerLogout = async () => {
     try {
       const response = await fetch(`${API_BASE}/api/boss/logout`, { method: 'POST' })
@@ -819,6 +861,10 @@ export default function BossPage() {
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiStop className="mr-1" /> 停止中…
               </Button>
+            ) : !isDelivering && riskAlert ? (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
+                <BiError className="mr-1" /> 风控待处理
+              </Button>
             ) : isDelivering ? (
               <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
                 <BiStop className="mr-1" /> 停止投递
@@ -828,7 +874,12 @@ export default function BossPage() {
                 <BiPlay className="mr-1" /> 开始投递
               </Button>
             )}
-            {!checkingLogin && isLoggedIn && !isDelivering && (
+            {!checkingLogin && isLoggedIn && !isDelivering && riskAlert && (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
+                <BiTestTube className="mr-1" /> 单次测试
+              </Button>
+            )}
+            {!checkingLogin && isLoggedIn && !isDelivering && !riskAlert && (
               <Button onClick={() => setShowTestDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white px-4 shadow-lg">
                 <BiTestTube className="mr-1" /> 单次测试
               </Button>
@@ -842,6 +893,35 @@ export default function BossPage() {
           </div>
         }
       />
+
+      {riskAlert && (
+        <div className="rounded-xl border-2 border-red-500 bg-red-50 dark:bg-red-950/40 p-4 shadow-lg">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div className="space-y-1 text-sm">
+              <div className="flex items-center gap-2 text-base font-semibold text-red-600 dark:text-red-400">
+                <BiError className="text-xl" />
+                Boss 触发{riskAlert.alertType || '风控'}，投递已自动停止
+              </div>
+              <p className="text-red-700 dark:text-red-300">
+                触发时间：{riskAlert.createdAt ? riskAlert.createdAt.replace('T', ' ') : '未知'}
+                {riskAlert.keyword ? `　关键词：${riskAlert.keyword}` : ''}
+                {riskAlert.jobName ? `　岗位：${riskAlert.jobName}` : ''}
+              </p>
+              {riskAlert.detail && <p className="text-red-700 dark:text-red-300">说明：{riskAlert.detail}</p>}
+              {riskAlert.pageUrl && <p className="text-red-700/80 dark:text-red-300/80 break-all">页面：{riskAlert.pageUrl}</p>}
+              <p className="text-red-700 dark:text-red-300">
+                请在 noVNC 的 Boss 标签页查看：安全验证需人工完成；访问受限需等平台恢复。处理完成前「开始投递」「单次测试」不可用。
+              </p>
+            </div>
+            <Button
+              onClick={() => setShowRiskAckDialog(true)}
+              className="shrink-0 rounded-full bg-red-600 hover:bg-red-700 text-white px-5"
+            >
+              我已处理
+            </Button>
+          </div>
+        </div>
+      )}
 
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
@@ -1444,6 +1524,39 @@ export default function BossPage() {
                 </Button>
                 <div className="flex justify-end">
                   <Button variant="ghost" onClick={() => setShowTestDialog(false)} className="rounded-full px-4">取消</Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
+      {/* 风控处理确认弹框 */}
+      {showRiskAckDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white dark:bg-neutral-900 rounded-2xl shadow-2xl w-[92%] max-w-sm border border-gray-200 dark:border-neutral-800 animate-in fade-in zoom-in-95">
+            <Card className="border-0">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <BiError className="text-red-500" />
+                  确认已处理风控
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="pt-0">
+                <p className="text-sm text-muted-foreground mb-4">
+                  请确认已在 noVNC 中完成安全验证，或访问限制已解除、Boss 页面能正常浏览。确认后可以重新启动投递。
+                </p>
+                <div className="flex justify-end gap-2">
+                  <Button variant="ghost" onClick={() => setShowRiskAckDialog(false)} className="rounded-full px-4">
+                    取消
+                  </Button>
+                  <Button
+                    disabled={riskAcking}
+                    onClick={handleAckRiskAlert}
+                    className="rounded-full bg-red-600 hover:bg-red-700 text-white px-4"
+                  >
+                    {riskAcking ? '确认中…' : '确认已处理'}
+                  </Button>
                 </div>
               </CardContent>
             </Card>

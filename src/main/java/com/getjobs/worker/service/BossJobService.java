@@ -4,6 +4,7 @@ import com.getjobs.application.service.ConfigService;
 import com.getjobs.application.service.JobMatchService;
 import com.getjobs.application.service.MatchRuleService;
 import com.getjobs.application.service.BossService;
+import com.getjobs.application.service.BossRiskAlertService;
 import com.getjobs.worker.boss.Boss;
 import com.getjobs.worker.boss.BossConfig;
 import com.getjobs.worker.dto.JobProgressMessage;
@@ -45,6 +46,7 @@ public class BossJobService implements JobPlatformService {
     private final JobMatchService jobMatchService;
     private final MatchRuleService matchRuleService;
     private final BossService bossService;
+    private final BossRiskAlertService bossRiskAlertService;
 
     /** 近期已处理岗位的回看天数：这段时间内判定或发送过的岗位直接跳过 */
     private static final int RECENT_DAYS = 3;
@@ -128,6 +130,10 @@ public class BossJobService implements JobPlatformService {
         boolean success = false;
         String summary;
         try {
+            String blocked = riskAlertBlockMessage();
+            if (blocked != null) {
+                throw new IllegalStateException(blocked);
+            }
             cb.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
             playwrightManager.ensureReady();
             if (playwrightManager.ensurePlatformPage("boss")) {
@@ -192,7 +198,7 @@ public class BossJobService implements JobPlatformService {
                 throw new IllegalStateException(boss.getAbortReason());
             }
             success = true;
-            String newJobs = String.format("（新岗位 %d 个，跳过近期已处理 %d 个，名称预过滤 %d 次）", boss.getNewJobCount(), boss.getSkippedOldCount(), boss.getTitleFilteredCount());
+            String newJobs = String.format("（新岗位 %d 个，跳过近期已处理 %d 个，卡片预过滤 %d 次）", boss.getNewJobCount(), boss.getSkippedOldCount(), boss.getTitleFilteredCount());
             if (stopping) {
                 summary = "已按停止指令结束" + newJobs;
             } else if (boss.getLimitNotice() != null) {
@@ -312,7 +318,21 @@ public class BossJobService implements JobPlatformService {
         status.put("evaluations", evals);
         status.put("lastResult", lastResult);
         status.put("todayGreetings", bossService.countTodayGreetings());
+        status.put("riskAlert", bossRiskAlertService.getActiveAlert());
         return status;
+    }
+
+    /**
+     * 存在未处理的风控提醒时，返回拒绝启动的提示。
+     * 入参：无。
+     *
+     * @return String，拒绝原因；没有未处理提醒时为 null
+     */
+    public String riskAlertBlockMessage() {
+        java.util.Map<String, Object> alert = bossRiskAlertService.getActiveAlert();
+        if (alert == null) return null;
+        return "Boss 曾触发" + alert.get("alertType") + "（" + alert.getOrDefault("createdAt", "") + "），"
+                + "请先在 noVNC 中人工处理，再到 Boss 配置页点「我已处理」后启动";
     }
 
     @Override

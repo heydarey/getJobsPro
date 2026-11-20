@@ -27,9 +27,23 @@ final class BossChatNavigator implements AutoCloseable {
     private final Page origin;
     private final List<Page> popups = new ArrayList<>();
     private final Consumer<Page> popupListener = popups::add;
+    /** 返回 true 时 close() 不关闭任何页面（风控已触发，验证页留给人工处理） */
+    private final Supplier<Boolean> keepOpen;
 
+    /**
+     * @param origin Page，必填，岗位详情页
+     */
     BossChatNavigator(Page origin) {
+        this(origin, () -> false);
+    }
+
+    /**
+     * @param origin   Page，必填，岗位详情页
+     * @param keepOpen Supplier&lt;Boolean&gt;，必填，返回 true 时结束时不关闭页面
+     */
+    BossChatNavigator(Page origin, Supplier<Boolean> keepOpen) {
         this.origin = origin;
+        this.keepOpen = keepOpen;
         origin.onPopup(popupListener);
     }
 
@@ -117,6 +131,10 @@ final class BossChatNavigator implements AutoCloseable {
     @Override
     public void close() {
         origin.offPopup(popupListener);
+        if (Boolean.TRUE.equals(keepOpen.get())) {
+            log.info("风控已触发，保留详情页与聊天页，不做关闭");
+            return;
+        }
         // 只清理由当前岗位点击产生的新窗口，不影响其他招聘平台标签页。
         for (Page popup : popups) closePage(popup);
         closePage(origin);
@@ -124,7 +142,12 @@ final class BossChatNavigator implements AutoCloseable {
 
     private void closePage(Page page) {
         try {
-            if (!page.isClosed()) page.close();
+            if (page.isClosed()) return;
+            if (BossRiskDetector.classifyUrl(page.url()) != null) {
+                log.info("页面停在风控页，保留不关闭：{}", page.url());
+                return;
+            }
+            page.close();
         } catch (PlaywrightException error) {
             log.debug("关闭本轮聊天页失败：{}", error.getMessage());
         }

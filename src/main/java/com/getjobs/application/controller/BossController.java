@@ -1,6 +1,7 @@
 package com.getjobs.application.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.getjobs.application.service.BossRiskAlertService;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import com.getjobs.worker.manager.PlaywrightManager;
@@ -36,6 +37,7 @@ public class BossController {
     private final BossJobService bossJobService;
     private final PlaywrightManager playwrightManager;
     private final CookieService cookieService;
+    private final BossRiskAlertService bossRiskAlertService;
 
     private final List<SseEmitter> bossProgressEmitters = new CopyOnWriteArrayList<>();
 
@@ -69,6 +71,10 @@ public class BossController {
     /** POST - 启动Boss投递任务 */
     @PostMapping("/execute")
     public ResponseEntity<Map<String, Object>> executeBoss() {
+        String blocked = bossJobService.riskAlertBlockMessage();
+        if (blocked != null) {
+            return ResponseEntity.badRequest().body(Map.of("status", "risk_alert", "message", blocked));
+        }
         long runId = bossJobService.tryAcquire("normal");
         if (runId == 0L) {
             return ResponseEntity.ok(Map.of(
@@ -116,6 +122,13 @@ public class BossController {
     private ResponseEntity<Map<String, Object>> startRun(String mode) {
         Map<String, Object> response = new HashMap<>();
         try {
+            String blocked = bossJobService.riskAlertBlockMessage();
+            if (blocked != null) {
+                response.put("success", false);
+                response.put("message", blocked);
+                response.put("status", "risk_alert");
+                return ResponseEntity.badRequest().body(response);
+            }
             if (!playwrightManager.isLoggedIn("boss")) {
                 response.put("success", false);
                 response.put("message", "请先登录Boss直聘");
@@ -147,6 +160,43 @@ public class BossController {
             response.put("success", false);
             response.put("message", "启动Boss任务失败: " + e.getMessage());
             response.put("error", e.getClass().getSimpleName());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    /**
+     * 查询未处理的 Boss 风控提醒。
+     * 入参：无。
+     *
+     * @return Map，active:boolean、alert:Map（见 BossRiskAlertService.getActiveAlert，无提醒时为 null）
+     */
+    @GetMapping("/riskAlert")
+    public ResponseEntity<Map<String, Object>> riskAlert() {
+        Map<String, Object> alert = bossRiskAlertService.getActiveAlert();
+        Map<String, Object> response = new HashMap<>();
+        response.put("active", alert != null);
+        response.put("alert", alert);
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * 管理员确认已在 noVNC 中处理完风控（完成验证或已解封），解除启动限制。
+     * 入参：无。
+     *
+     * @return Map，success:boolean、message:String、count:int（本次确认的提醒条数）
+     */
+    @PostMapping("/riskAlert/acknowledge")
+    public ResponseEntity<Map<String, Object>> acknowledgeRiskAlert() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            int n = bossRiskAlertService.acknowledge();
+            response.put("success", true);
+            response.put("count", n);
+            response.put("message", n > 0 ? "已确认处理，可以重新启动投递" : "没有未处理的风控提醒");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
             return ResponseEntity.internalServerError().body(response);
         }
     }

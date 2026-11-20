@@ -17,7 +17,7 @@ class BossRepeatChatTest {
     @CsvSource({"立即沟通,false,true,false", "立即沟通,true,true,false", "继续沟通,false,false,false", "继续沟通,true,true,false", "立即沟通,,true,false", "继续沟通,,false,false", "已关闭,true,false,false", "继续沟通,true,false,true"})
     void sendsOnlyWhenButtonAndSwitchAllow(String text, Boolean enabled, boolean expected, boolean emptyMessages) throws Exception {
         BossService service = mock(BossService.class);
-        Boss boss = new Boss(service, null, null);
+        Boss boss = new Boss(service, null, null, null);
         BossConfig config = new BossConfig();
         config.setAllowRepeatChat(enabled);
         config.setSayHi("您好，希望进一步沟通。");
